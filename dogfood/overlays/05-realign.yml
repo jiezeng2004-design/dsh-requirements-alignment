@@ -1,0 +1,5 @@
+- id: scripted-answers
+  config:
+    default:
+      custom: 'Multi-user with accounts and cloud sync.'
+    recordPath: '__DOGFOOD_RECORD_PATH__'

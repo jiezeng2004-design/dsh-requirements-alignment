@@ -1,0 +1,14 @@
+{
+  "name": "local-tasks",
+  "version": "0.2.0",
+  "description": "A multi-user task manager with accounts and cloud sync via a self-hosted Node server.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "client": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

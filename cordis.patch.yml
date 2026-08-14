@@ -1,0 +1,20 @@
+# dsh-requirements-alignment bundle patch
+#
+# Applied as one insert over the profile root, after the dsh-base layer.
+# Removing this bundle (dsh plugin --profile <name> rm dsh-requirements-alignment)
+# removes both rows and restores the previous behavior.
+
+- insert:
+    # The alignment controller: auto-mode policy section, /align command,
+    # and durable alignment state. mode: auto | manual | off
+    - id: requirements-alignment
+      name: 'dsh-requirements-alignment'
+      config:
+        mode: auto
+
+    # The model-facing question tool over the native ctx.userQuestions seam.
+    # Shipped profiles mount it per-agent through the agent preset; this row
+    # guarantees it exists in compositions without presets (e.g. headless),
+    # where alignment would otherwise have no question channel.
+    - id: requirements-alignment-ask-user
+      name: '@deepseek-ai/dsh-tool-ask-user'

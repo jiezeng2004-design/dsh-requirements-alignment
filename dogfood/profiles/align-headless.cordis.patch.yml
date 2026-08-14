@@ -1,0 +1,10 @@
+# Dogfood-only overlay for the align-headless profile: mounts the scripted
+# user-questions provider so headless runs can exercise the full native
+# question -> answer -> continue loop. Scenario overlays (--patch) replace the
+# row config per run (record path + answers).
+- insert:
+    - id: scripted-answers
+      name: 'dsh-requirements-alignment/scripted-provider'
+      config:
+        default:
+          selected: []

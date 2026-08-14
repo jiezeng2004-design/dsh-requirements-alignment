@@ -1,0 +1,7 @@
+# User data — do not commit
+data/
+
+# Local session token (which account this machine is logged in as)
+.session.json
+
+node_modules/

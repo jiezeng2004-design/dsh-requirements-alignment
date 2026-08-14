@@ -1,0 +1,5 @@
+- id: scripted-answers
+  config:
+    default:
+      custom: 'A local-first single-user web application.'
+    recordPath: '__DOGFOOD_RECORD_PATH__'
