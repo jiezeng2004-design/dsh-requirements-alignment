@@ -222,6 +222,45 @@ test('statusValueText: labels the four postures without gate claims', () => {
     assert.match(statusValueText('unknown'), /Unknown/);
 });
 
+test('controller: public registration contract — Auto / Manual / Off', async () => {
+    const matrix = [
+        { mode: 'auto' as const, policy: true, tools: true, align: true, modeLine: 'Mode: Auto' },
+        { mode: 'manual' as const, policy: false, tools: true, align: true, modeLine: 'Mode: Manual' },
+        { mode: 'off' as const, policy: false, tools: false, align: false, modeLine: undefined }
+    ];
+    for (const row of matrix) {
+        const { sections, commands, tools } = await mount({ mode: row.mode });
+        assert.equal(sections.length > 0, row.policy, `${row.mode}: policy section`);
+        if (row.policy) {
+            assert.equal(sections[0]!.name, POLICY_SECTION);
+            assert.equal(sections[0]!.order, POLICY_ORDER);
+        }
+        assert.equal(tools.length > 0, row.tools, `${row.mode}: alignment tools`);
+        if (row.tools) {
+            assert.deepEqual(tools.map((tool) => tool.name).sort(), ['establish_baseline', 'report_drift']);
+        }
+        assert.equal(commands.length > 0, row.align, `${row.mode}: /align`);
+        if (row.align) {
+            assert.equal(commands[0]!.name, 'align');
+            const { agent } = fakeAgent();
+            const result = await commands[0]!.handler({
+                agent: agent as never,
+                rawInput: '',
+                signal: new AbortController().signal,
+                commandId: `contract-${row.mode}` as never
+            });
+            assert.equal(result.kind, 'success');
+            assert.match(result.text ?? '', /Requirements Alignment/);
+            assert.match(result.text ?? '', new RegExp(row.modeLine!));
+            assert.doesNotMatch(result.text ?? '', /Mode: Off/);
+        } else {
+            assert.equal(commands.length, 0);
+            assert.equal(sections.length, 0);
+            assert.equal(tools.length, 0);
+        }
+    }
+});
+
 test('controller: /align reports baseline-update-pending after approve without a new baseline', async () => {
     const { commands } = await mount({ mode: 'auto' });
     const { agent, events } = fakeAgent();
