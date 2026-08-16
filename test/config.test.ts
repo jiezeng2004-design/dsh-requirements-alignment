@@ -7,7 +7,7 @@ import {
     resolveConfig
 } from '../src/index.ts';
 
-/** Apply the shipped Config schema (the same object Cordis / the settings UI use). */
+/** Apply the shipped Config schema (the same object Cordis uses at load). */
 function applySchema(input?: unknown) {
     return ConfigSchema(input as never);
 }
@@ -58,7 +58,7 @@ test('config: rejects blank or non-string section', () => {
     assert.throws(() => resolveConfig({ section: 42 } as never), /must be a string/);
 });
 
-test('config: plugin Config is the shipped Schemastery schema (enum the settings UI can render)', () => {
+test('config: plugin Config is the shipped Schemastery schema (enum auto / manual / off)', () => {
     assert.equal(RequirementsAlignmentController.Config, ConfigSchema);
     assert.equal(ConfigSchema.type, 'object');
     assert.equal(ConfigSchema.dict?.mode?.type, 'union');

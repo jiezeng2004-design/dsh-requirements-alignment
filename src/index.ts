@@ -40,7 +40,7 @@ import type { AlignmentStatus, AlignmentStatusValue } from './types.ts';
 /** Alignment operation mode. */
 export type AlignmentMode = 'auto' | 'manual' | 'off';
 
-/** Legal mode names — the enum the native settings UI renders. YAML stays `mode: auto|manual|off`. */
+/** Legal mode names used by the configuration schema and load validation. YAML stays `mode: auto|manual|off`. */
 export const ALIGNMENT_MODES = ['auto', 'manual', 'off'] as const;
 
 /** Raw plugin config. */
@@ -52,10 +52,10 @@ export interface Config {
 }
 
 /**
- * DSH/Schemastery native Config schema. The settings UI renders `mode` as an
- * enum (`auto` / `manual` / `off`). YAML stays `mode: auto|manual|off`
- * (default `auto`). Cordis validates incoming config through this schema's
- * Standard Schema contract before the plugin starts.
+ * DSH/Schemastery Config schema for configuration structure, loading, and
+ * validation. `mode` is the enum `auto` / `manual` / `off`. YAML stays
+ * `mode: auto|manual|off` (default `auto`). Cordis validates incoming config
+ * through this schema's Standard Schema contract before the plugin starts.
  */
 export const ConfigSchema = Schema.object({
     mode: Schema.union(ALIGNMENT_MODES)
@@ -149,7 +149,7 @@ export function statusText(status: AlignmentStatus, mode?: Exclude<AlignmentMode
  */
 export class RequirementsAlignmentController extends Service {
     static inject = ['systemPrompt', 'tools'];
-    /** Native Config schema (enum `mode`) for the DSH settings UI and Cordis load. */
+    /** Native Config schema (enum `mode`) for Cordis load validation. */
     static Config = ConfigSchema;
 
     /** Validated deployment-owned config. */

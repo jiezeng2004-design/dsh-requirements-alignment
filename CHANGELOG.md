@@ -6,11 +6,13 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- **Native mode schema.** The plugin now exports a DSH/Schemastery `Config`
-  schema so the settings UI can render `mode` as an enum (`auto` / `manual` /
-  `off`). YAML stays `mode: auto|manual|off` (default `auto`). `resolveConfig`
-  remains the runtime rule: invalid `mode`, unknown keys, and a blank or
-  non-string `section` still fail at load.
+- **Native configuration schema for auto / manual / off modes.** The plugin
+  now exports a DSH/Schemastery `Config` schema so Cordis can validate
+  `mode` as `auto` / `manual` / `off` at load. YAML stays
+  `mode: auto|manual|off` (default `auto`). `resolveConfig` remains the
+  runtime rule: invalid `mode`, unknown keys, and a blank or non-string
+  `section` still fail at load. Current DSH Web does not auto-generate a
+  Settings UI control from this schema for third-party plugins.
 - **`/align` mode line.** Auto and Manual status text includes `Mode: Auto` or
   `Mode: Manual`. Off still registers no `/align`.
 - **Three-mode packed smoke.** `scripts/packed-smoke.ps1` installs the current

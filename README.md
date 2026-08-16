@@ -58,13 +58,16 @@ Use `/align` any time you want to inspect whether the current execution still ma
 
 ## Choose how alignment runs
 
-The plugin exposes `mode: auto | manual | off` through the native DSH / Schemastery Config schema (the settings UI renders the enum). YAML is unchanged:
+The plugin exposes `mode: auto | manual | off` through its configuration schema for validation and configuration loading. In the current DSH Web release, third-party plugin configuration is not automatically surfaced as a Settings UI control, so the mode is configured through the profile bundle configuration.
 
 ```yaml
 - id: requirements-alignment
+  name: dsh-requirements-alignment
   config:
-    mode: auto   # auto | manual | off  (default: auto)
+    mode: auto
 ```
+
+After you change `mode` in the profile bundle, restart the current DSH Web profile so it starts with the new composition config.
 
 **Auto is the recommended default.** Clear tasks run with zero interruption; you are only asked when the execution is about to change direction.
 
