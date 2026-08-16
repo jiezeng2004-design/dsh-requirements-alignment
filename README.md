@@ -1,38 +1,36 @@
 # dsh-requirements-alignment
 
-> Lightweight requirement alignment for DeepSeek Harness.
+> Runtime requirement drift guard for DeepSeek Harness.
+
+Keep long-running agents aligned with user intent while they work.
 
 ## Overview
 
-`dsh-requirements-alignment` adds a lightweight alignment layer before [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agents execute ambiguous or high-impact requests. It asks only when a decision materially affects direction, remembers resolved choices within the session, and stays out of the way once the intent is clear.
+`dsh-requirements-alignment` turns the user's request into a durable **requirement baseline** — goal, protected constraints, must-preserve behavior, allowed scope, and settled user decisions — and guards it while the agent executes. The agent works silently until a step would materially change the task direction; only then does the plugin surface a **drift candidate** to you, records your decision, and updates the baseline. Everything is folded from log-only session events, so resume, fork, and compaction recover the same state.
 
 **You decide the direction. The agent decides the engineering.**
 
-## Why this plugin exists
+## Requirements Alignment vs Plan Mode
 
-An agent can produce technically sound work in the wrong product direction when a request leaves a high-impact choice unresolved. This plugin applies the minimum intervention needed to surface that choice before execution: one focused question at a time, followed by autonomous implementation once the direction is coherent. It re-aligns only when the task direction materially changes.
+```
+Plan Mode asks:            "Is this the right implementation plan?"
+Requirements Alignment asks: "Are we still solving the right problem?"
+```
 
-## Focused scope
+> Plan Mode prevents a bad plan from starting.
+> Requirements Alignment prevents a good plan from drifting.
 
-`dsh-requirements-alignment` intentionally focuses only on requirement direction alignment. It does not impose a complete engineering workflow and it does not change the user's normal DSH workflow.
-
-It is **not**:
-
-- a spec, TDD, code-review, or delivery-verification framework;
-- a complete software development methodology;
-- an interview bot (it asks 1 question at a time, then stops);
-- a replacement for plan mode (`/plan` reviews a plan; this plugin aligns *direction* before implementation);
-- a Web dashboard, database, or RAG system;
-- a modification of DSH Core — it is a plain profile bundle.
+Plan Mode is the official review-approve step *before* implementation. Requirements Alignment is intent continuity *during* execution. They compose: plan, approve, execute — and this plugin keeps the execution on the approved direction. It never modifies plan mode, `exit_plan_mode`, or any `@deepseek-ai/*` core package.
 
 ## How it works
 
 | Mechanism | What it does |
 |---|---|
-| System-prompt policy section | In `auto` mode (default) the alignment policy is contributed to every agent's prompt at order 60. After the first question round in a session, a no-repeat guard is appended ("do not re-run alignment for settled decisions; only re-align when a NEW direction-defining decision appears"). |
-| Native user questions | The model asks through the shipped `ask_user_question` tool over the `ctx.userQuestions` seam — the same UI channel the Web client renders. The plugin's bundle also mounts `@deepseek-ai/dsh-tool-ask-user` so the tool exists in compositions without agent presets (e.g. headless). |
-| `/align` command | Manual entry: records a durable `alignment/status` check, reports the session's folded status, and steers a compact alignment-check instruction into the agent for the actual analysis. |
-| Durable session state | `alignment/status` events plus folded `ask_user_question` tool calls give per-session alignment state that survives resume, fork, and compaction (read straight from the session log — no live mirror). |
+| System-prompt policy section | In `auto` mode (default) the drift-guard policy is contributed to every agent's prompt at order 60. It teaches the agent to hold a requirement baseline, monitor silently, and detect direction-level drift — scope expansion, constraint conflict, user-visible behavior change, architecture shift, invalidated assumptions, user direction change. |
+| `establish_baseline` tool | Records the baseline (goal, `explicitConstraints`, `mustPreserve`, `allowedScope`, `userDecisions`, `openDirectionDecisions`). Silent — it never asks the user. Recording again bumps the baseline revision. |
+| `report_drift` tool | Records a drift candidate (`reason`, `description`, `requiredChange`), asks you one question through the native user-questions channel, and records your decision. The default approve / stay-within-scope options are always offered; the two defaults map to `approve` / `reject`, a model-supplied alternative direction you pick — or your own free-text answer — maps to `revise` with your exact words as the note, never to a silent rejection. The tool result returns your exact choice (the `note`) and the required baseline change to the agent, so it never re-asks what you picked. Only this plugin's events feed the alignment state — unrelated `ask_user_question` calls (plan mode, other plugins) never pollute it. |
+| `/align` command | Manual entry: reports the folded status (baseline revision, goal, protected constraints, drift count, last drift, last decision, current status) and steers a fresh alignment inspection into the agent. It inspects; it never blocks execution. |
+| Durable session state | Dedicated `alignment/*` events plus pure fold functions give per-session alignment state that survives resume, fork, and compaction — read straight from the session log, no live mirror. |
 
 ## Installation
 
@@ -45,18 +43,18 @@ dsh plugin --profile web add dsh-requirements-alignment
 
 The plugin is a **profile bundle** (`dsh.bundle.patch` + `cordis.patch.yml`), so it installs through the standard plugin mechanism and adds two rows:
 
-- `requirements-alignment` — the controller (`mode: auto` by default);
+- `requirements-alignment` — the controller (policy section, `/align`, both tools);
 - `requirements-alignment-ask-user` — the model-facing question tool.
 
 ## Quick Start
 
-Install the bundle, start a normal DSH task, and answer only if DSH surfaces a direction-defining choice. Auto mode is enabled by default; no separate command or workflow is required.
+Install the bundle and start a normal DSH task. Auto mode is enabled by default; clear tasks run with zero interruption, and you are only asked when the execution is about to change direction.
 
 ```powershell
 dsh plugin --profile web add dsh-requirements-alignment
 ```
 
-Use `/align` when you want to request the same structured alignment check manually.
+Use `/align` any time you want to inspect whether the current execution still matches the requirement baseline.
 
 ## Enable / disable / uninstall
 
@@ -72,26 +70,19 @@ Use `/align` when you want to request the same structured alignment check manual
 dsh plugin --profile web rm dsh-requirements-alignment
 ```
 
-Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the `/align` command, and the tool row. Session history keeps the `alignment/status` events it appended (like every other plugin event, e.g. `plan/mode`).
-
-## Behavior and decision logic
-
-- Clear, repository-established work proceeds without an alignment question.
-- Ambiguous or high-impact work asks about the highest-priority unresolved direction decision.
-- Resolved direction choices are not repeatedly re-asked within the same session.
-- A material direction change can trigger a new alignment round.
-- Disabling or unloading the plugin removes its active registrations.
+Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the `/align` command, and both tools. Session history keeps the `alignment/*` events it appended (like every other plugin event, e.g. `plan/mode`).
 
 ## Auto mode (default)
 
-No setup needed. The policy section is present in every agent's system prompt:
+The policy section is present in every agent's system prompt. Behavior at task start:
 
-- **Greenfield or vague work** (blank project, new product, undefined form / scope / interaction) triggers the *Greenfield Alignment Gate*: the agent confirms product goal, MVP scope, and primary interaction before substantive implementation — asking **one question at a time** via `ask_user_question`, highest-priority decision first, 2–3 distinct options, a clear recommendation first.
-- **Explicit work** (repository establishes direction, or a clear local change like a bug fix) proceeds without questions. The agent never asks about filenames, helper placement, library choice, formatting, or anything the repository already establishes.
-- **Delegated direction** ("pick whatever makes sense") does **not** waive the gate: the agent still asks the one highest-priority direction question before the first substantive implementation, then decides everything else itself.
-- **Re-alignment**: when a NEW direction-defining decision appears mid-work (multi-user accounts, cloud sync, a new product form, …), the agent asks again — but never re-runs alignment for settled decisions.
+- **Clear request with protected scope** ("Fix the form bug without changing the UI or public API") — the agent records a *light* baseline with `establish_baseline` (silent) **before the first substantive edit**, pinning the constraints, then works. No user question is involved.
+- **Trivial request** ("Fix the typo in README.md") — nothing is recorded; the agent just works.
+- **No baseline can be formed** (greenfield / vague: new product, undefined form, scope, or interaction) — the agent asks the ONE highest-priority direction question via `ask_user_question`, records the baseline, and works.
 
-Auto mode's judgment is the model's (it is a policy, not a gate). That is the honest limit of the mechanism; see *Limitations*.
+During execution the agent is **fully silent** unless an action would materially change the baseline (drift). There are no periodic checks, no tool-call counting, no per-file questions. When a drift candidate appears, the agent calls `report_drift` *before* acting; the tool result names your exact choice back to the agent (the `note` and any required baseline change), it records the outcome and, if you approved or revised the direction, the baseline advances to the next revision. The same choice is projected in the per-session baseline summary, so an interrupted or crashed run that resumes knows exactly what you picked without asking again.
+
+A delegated instruction such as "pick whatever makes sense" does not waive the one start question for a greenfield idea.
 
 ## Manual `/align`
 
@@ -108,30 +99,60 @@ Manual mode contributes no policy section — the agent works normally until you
 /align
 ```
 
-`/align` records the check, reports the session's alignment status (question rounds so far, last manual check), and hands the actual analysis to the agent, which then behaves exactly as in auto mode for that step. It never takes over the workflow.
+`/align` records the inspection, reports the folded status, and steers a fresh alignment check into the agent (which may then run the drift protocol if it finds a candidate). It never takes over the workflow and never blocks execution.
 
 ## Example interaction
 
 ```text
-User: Build me a personal task manager.
-Agent: Where should the first version run: local web app, desktop app, or mobile app?
-User: Local web app.
-Agent: [implements without continuing a requirements interview]
+User:  Fix the submit bug. Don't change the UI or the public API.
+Agent: [records the baseline silently, fixes the bug — no questions]
 ```
 
-| User request | Behavior |
+```text
+User:  The result-page filter is the only thing to improve. Do not refactor backend logic.
+Agent: [working… discovers the backend filter itself is broken and a correct fix would
+       need backend changes]
+Agent: [report_drift → you are asked]
+User:  Stay within the current scope.
+Agent: [improves the UI only, leaves the backend untouched]
+```
+
+```text
+User:  The app is single-user and local-only. Now make it work across devices.
+Agent: [detects an architecture shift]
+Agent: [report_drift → you are asked]
+User:  Approve the direction change — multi-user with accounts and cloud sync.
+Agent: [records the updated baseline (revision advances) and implements]
+```
+
+## Drift taxonomy
+
+The plugin records one of these reasons on every drift candidate:
+
+| Reason | Meaning |
 |---|---|
-| "Build me a personal task manager." | Asks about product form / primary usage first, then implements. |
-| "Fix the typo in README.md." | No questions; fixes it. |
-| "The submit button throws TypeError when form.email is undefined. Fix it without changing the UI." | No interview; fixes the bug. |
-| "Build me an AI tool that can make money. Pick whatever makes sense." | Still asks the one highest-priority direction question (which product / which user), then decides the rest itself. |
-| "Now make it support multiple users across devices." (existing local app) | Re-aligns: asks about identity / sync / backend ownership, then implements. |
+| `scope-expansion` | Doing materially more than asked (e.g. "optimize the page" → "refactor all state management"). |
+| `constraint-conflict` | An explicit constraint blocks the way ("keep the API" — but the API must change to continue). |
+| `behavior-change` | A decision changes product behavior, UX, defaults, or compatibility without prior authorization. |
+| `architecture-shift` | Local→cloud, backend, auth, multi-user, sync, persistence model, public API, schema, migration. |
+| `data-model-change` | The data model must change in a way the user did not authorize. |
+| `compatibility-change` | Existing callers, formats, or APIs would break. |
+| `assumption-invalidated` | The implementation rested on a key assumption the code now disproves, and continuing needs a new direction. |
+| `user-direction-change` | The user introduced a new direction mid-task. |
+
+## What never triggers alignment
+
+The agent decides autonomously: filenames, helper placement, variable naming, map vs loop, routine refactors, formatter, lint, test placement, ordinary library use, the repository's established stack, small internal designs that do not change observable behavior, in-scope bug fixes, and necessary test additions.
+
+## Subagents
+
+DSH child agents cannot ask the user (`ask_user_question` and `report_drift` reject with `DELEGATED_CALLER` for owned children). A child that would need to change the baseline does not decide: it includes a `Requirement drift candidate` block — reason, current baseline, required change, decision needed — in its final report (or the `report` tool when available). The parent owns the user interaction and runs the drift protocol.
 
 ## Configuration
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `auto` | `auto` — policy section + command; `manual` — command only; `off` — inert (row loaded, nothing registered). |
+| `mode` | `auto` | `auto` — policy section + tools + command; `manual` — tools + command only; `off` — inert (row loaded, nothing registered). |
 | `section` | shipped policy | Deployment-owned policy text replacing the shipped one (auto mode). Must be non-empty when provided. |
 
 Unknown config keys fail at load (same stance as `dsh-plan-mode`).
@@ -139,17 +160,17 @@ Unknown config keys fail at load (same stance as `dsh-plan-mode`).
 ## Safety boundary
 
 - **No Core modifications.** Zero changes to `@deepseek-ai/*` packages; the only host-side file touched is the profile's bundle list / patch, which is exactly the mechanism DSH provides for installing plugins.
-- **Question channel only.** The plugin never reads or writes the user's data; it appends two log-only session events and steers one user message on `/align`.
+- **Question channel only.** The plugin never reads or writes the user's data; it appends log-only session events and steers one user message on `/align`.
 - **No file access.** It does not inspect the filesystem itself; the agent does that with its own tools under the normal sandbox.
-- **No background monitoring.** Re-alignment is triggered by the model noticing new direction-defining decisions, not by a watcher; there is no repeated interruption loop.
+- **No background monitoring.** Drift detection is model-driven policy, not a watcher; there is no periodic interruption loop.
 
 ## Limitations
 
-- **Auto mode is policy, not enforcement.** Whether a decision is direction-defining is the model's judgment (that is also the product design: "user decides direction, agent decides engineering"). A model can still under- or over-ask; the no-repeat guard and the one-question-at-a-time rule reduce over-asking, and the delegated-direction rule reduces under-asking, but neither is a hard gate. For a hard gate, run alignment manually via `/align`.
+- **Soft guard, not a hard gate.** Whether an action is a drift candidate is the model's judgment (that is the product design: "user decides direction, agent decides engineering"). The plugin records and re-aligns; it does not block execution. A future `mode: guard` can build on the same events (the fold already derives `drift-pending` and `baseline-update-pending`) without changing the architecture.
+- **Natural drift detection is model-driven.** In natural runs (no protocol instruction in the task), a mid-task user direction change triggers `report_drift` in a fraction of runs (measured honestly in the acceptance report: 3/4 in the RC benchmark); agent-detected constraint conflicts are more reliable. The policy is written to maximize the natural rate; the mechanism itself is deterministic once invoked.
 - **`/align` needs a command adapter.** UI-less spines (the headless profile, ACP automation) do not dispatch slash commands; the command is exercised by the Web client and by the unit tests / dogfood driver.
-- **Subagents cannot ask the user.** DSH rejects `ask_user_question` from owned children; the policy tells child agents to surface unresolved direction decisions in their final report instead.
-- **One question round = one `ask_user_question` call.** The no-repeat guard counts tool calls; other plugins' questions to the user count the same way.
-- **Question rounds are counted per session log**, so a resumed session inherits its alignment state — by design.
+- **Subagents cannot ask the user.** They report drift candidates to the parent, which owns the interaction.
+- **Baseline content is model-produced.** The fold is deterministic; what the model records as the baseline is the model's reading of the task. Keep prompts explicit when the direction matters.
 
 ## Testing and verification
 
@@ -159,20 +180,32 @@ The release gate runs type checking, linting, a production build, and the Node t
 pnpm run check
 ```
 
-Real DSH dogfooding covers clear requests, ambiguous direction choices, duplicate-question suppression, direction-change re-alignment, manual `/align`, and plugin load/unload behavior:
+Real DSH dogfooding boots real `dsh` profiles with an isolated `DSH_HOME`. Three run modes keep development fast and honest:
 
 ```powershell
-powershell -File scripts/dogfood.ps1
+powershell -File scripts/dogfood.ps1 -Smoke        # development: 02-typo, 03-bugfix, 04-scope-drift, 09-drift-choice
+powershell -File scripts/dogfood.ps1 -Scenario 12-interrupt-revise   # one scenario
+powershell -File scripts/dogfood.ps1               # FULL correctness suite (RC gate): 01..12 minus the 05 benchmark
+powershell -File scripts/dogfood.ps1 -Benchmark05  # natural benchmark: 3 runs, reports NATURAL DRIFT TRIGGER N/M
 ```
 
-The v0.1.1 release gate verified:
+`-FailFast` aborts at the first failed check; `-TimeoutSec <n>` (default 600) is a hard per-scenario timeout that kills the process tree. Scenario tasks for natural-behavior cases (03, 04, 05) contain NO protocol instructions; protocol-forced mechanism cases (01, 06, 07, 08, 09, 10, 11, 12) are reported separately — the natural drift trigger rate is its own metric, never presented as a mechanism verification. The full suite must run under `danger-full-access` (see `docs/PROJECT-MEMORY.md`).
+
+The packed-artifact smoke packs the current tarball, installs it into a disposable profile, boots a real task through it (`/align` executes, `establish_baseline` works, the policy section is present — verified via the assembled system prompt / section registry, not a loose word match), removes it, and verifies the profile restores cleanly:
+
+```powershell
+powershell -File scripts/packed-smoke.ps1
+```
+
+The v0.2.0 release gate verified:
 
 - Core modifications: **0**
-- Node tests: **31/31 passing**
-- Real DSH dogfood scenarios: **6/6 passing**
-- Packed plugin load/unload: **verified**
+- Node tests: **84/84 passing**
+- Real DSH dogfood (full correctness suite): **63/63 checks passing** (11 scenarios)
+- Natural drift trigger: **3/4** natural runs fired `report_drift` on their own (04 ×1, 05 ×3)
+- Packed add/rm smoke: **14/14 checks passing** against the current v0.2.0 tarball
 
-Detailed evidence and the bounded-run caveat are recorded in `ACCEPTANCE.md`; the release notes report the same layers without treating a build as runtime proof.
+Detailed evidence and the bounded-run caveat are recorded in `ACCEPTANCE.md`.
 
 ## Development
 
@@ -181,14 +214,19 @@ pnpm install          # dependencies
 pnpm run typecheck    # tsc (src + test)
 pnpm run lint         # eslint (src + test)
 pnpm run build        # tsc → lib/
-pnpm test             # node:test (31 tests)
+pnpm test             # node:test (84 tests)
 pnpm run check        # all of the above
 ```
 
-Real dogfooding (boots real `dsh` profiles with an isolated `DSH_HOME`, runs the five behavioral scenarios plus a `/align` driver, and asserts the question records):
+Real dogfooding (boots real `dsh` profiles with an isolated `DSH_HOME`; smoke mode for development, full suite + natural benchmark + packed add/rm smoke for the RC gate):
 
 ```powershell
-powershell -File scripts/dogfood.ps1
+powershell -File scripts/dogfood.ps1 -Smoke
+powershell -File scripts/dogfood.ps1               # full correctness suite (RC gate)
+powershell -File scripts/dogfood.ps1 -Benchmark05  # natural drift benchmark
+powershell -File scripts/packed-smoke.ps1          # packed add/rm smoke (RC gate)
+# run a single scenario:
+powershell -File scripts/dogfood.ps1 -Scenario 05-arch-shift
 ```
 
 See `docs/ARCHITECTURE.md` for the design decisions and the exact capability seams used.
@@ -198,6 +236,7 @@ See `docs/ARCHITECTURE.md` for the design decisions and the exact capability sea
 - DeepSeek Harness `0.1.0-rc.6` (verified against the local profile bundle set and the npm registry releases of the same version).
 - `@deepseek-ai/cordis` 4.x, `@deepseek-ai/dsh-*` `^0.1.0-rc.6`.
 - Windows (verified) and POSIX (no platform-specific code).
+- Old v0.1 sessions fold safely: legacy `alignment/status` events still count as manual checks, and a session without the new events simply reports revision 0 / "unknown" instead of crashing.
 
 ## License
 

@@ -3,3 +3,8 @@
     default:
       custom: 'A local-first single-user web application.'
     recordPath: '__DOGFOOD_RECORD_PATH__'
+- insert:
+    - id: align-driver
+      name: 'dsh-requirements-alignment/align-driver'
+      config:
+        recordPath: '__DOGFOOD_RECORD_PATH__'

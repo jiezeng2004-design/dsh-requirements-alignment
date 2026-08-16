@@ -1,11 +1,11 @@
 - id: scripted-answers
   config:
     default:
-      custom: 'No answer needed.'
+      selected: []
     recordPath: '__DOGFOOD_RECORD_PATH__'
 - insert:
     - id: align-driver
       name: 'dsh-requirements-alignment/align-driver'
       config:
         recordPath: '__DOGFOOD_RECORD_PATH__'
-        snapshotFirstMutation: true
+        runAlign: true

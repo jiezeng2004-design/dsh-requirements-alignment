@@ -1,5 +1,0 @@
-- id: scripted-answers
-  config:
-    default:
-      custom: 'A tool that helps indie creators price their services.'
-    recordPath: '__DOGFOOD_RECORD_PATH__'

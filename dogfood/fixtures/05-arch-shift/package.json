@@ -1,0 +1,10 @@
+{
+  "name": "local-tasks",
+  "version": "0.1.0",
+  "description": "A single-user, local-first task manager. Tasks live in a local JSON file on this machine only.",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  }
+}

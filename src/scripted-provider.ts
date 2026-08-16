@@ -17,6 +17,12 @@ import type { AskUserQuestionAnswerItem } from '@deepseek-ai/dsh-user-questions'
 export interface ScriptedAnswer {
     /** Substring matched against the question text; omitted matches everything. */
     match?: string;
+    /**
+     * Select the first option whose label contains this substring. Useful for
+     * drift questions whose option labels are model-supplied: the answer stays
+     * correct regardless of the exact wording. Takes precedence over `selected`.
+     */
+    optionMatch?: string;
     /** Option labels to select. */
     selected?: string[];
     /** Free-form "Other" answer. */
@@ -77,9 +83,14 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: Script
             const answers: AskUserQuestionAnswerItem[] = request.questions.map((question) => {
                 const hit = resolved.answers.find((answer) => answer.match === undefined || question.question.includes(answer.match))
                     ?? resolved.default;
+                let selected = hit.selected ?? [];
+                if (hit.optionMatch !== undefined) {
+                    const matched = (question.options ?? []).find((option) => option.label.includes(hit.optionMatch!));
+                    if (matched !== undefined) selected = [matched.label];
+                }
                 const answer: AskUserQuestionAnswerItem = {
                     id: question.id,
-                    selected: hit.selected ?? []
+                    selected
                 };
                 if (hit.custom !== undefined) answer.custom = hit.custom;
                 record(resolved.recordPath, {

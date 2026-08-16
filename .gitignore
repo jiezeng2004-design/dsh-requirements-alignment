@@ -4,3 +4,5 @@ lib/
 .pnpm-store/
 dogfood/records/
 dogfood/logs/
+
+dogfood/scenarios/

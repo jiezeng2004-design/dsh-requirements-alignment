@@ -1,14 +1,18 @@
 /**
- * dsh-requirements-alignment: a native DeepSeek Harness plugin that aligns
- * unclear product direction before implementation.
+ * dsh-requirements-alignment: a native DeepSeek Harness plugin that acts as a
+ * runtime requirement drift guard.
  *
- * Auto mode (default) contributes an always-on alignment policy section to
- * every agent's system prompt and relies on the native `ask_user_question`
- * tool for questions. Manual mode contributes no section; the `/align`
- * command steers a compact check instruction into the agent. Both modes
- * record durable per-session state through `alignment/status` events and
- * fold `ask_user_question` tool calls, which powers the no-repeat guard and
- * the `/align` status report.
+ * While an agent executes, the plugin keeps a durable requirement baseline
+ * per session (goal, explicit constraints, must-preserve behavior, allowed
+ * scope, settled user decisions) folded from dedicated `alignment/*` session
+ * events. Auto mode (default) contributes a policy section to every agent's
+ * system prompt that teaches silent drift detection and the re-alignment
+ * protocol, plus two model-facing tools: `establish_baseline` (silent
+ * baseline recording) and `report_drift` (drift candidate + user decision).
+ * Manual mode contributes no section; the `/align` command steers a compact
+ * fresh-alignment inspection into the agent. Both modes record durable
+ * per-session state that survives resume, fork, and compaction (pure folds
+ * over the log — no live mirror).
  *
  * The plugin is a plain Cordis service: every registration is an effect
  * disposer owned by this fiber, so unloading the plugin (or disabling the
@@ -22,6 +26,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
 import type { AssembleContext } from '@deepseek-ai/dsh-system-prompt';
 import type { Agent } from '@deepseek-ai/dsh-agent';
+import { registerEstablishBaseline, registerReportDrift } from './baseline-tool.ts';
 import {
     MANUAL_CHECK_MESSAGE,
     POLICY_ORDER,
@@ -29,14 +34,14 @@ import {
     autoPolicyText
 } from './policy.ts';
 import { appendManualCheck, foldAlignmentStatus } from './status.ts';
-import type { AlignmentStatus } from './types.ts';
+import type { AlignmentStatus, AlignmentStatusValue } from './types.ts';
 
 /** Alignment operation mode. */
 export type AlignmentMode = 'auto' | 'manual' | 'off';
 
 /** Raw plugin config. */
 export interface Config {
-    /** `auto` (default) contributes the policy section; `manual` only the /align command; `off` nothing. */
+    /** `auto` (default) contributes the policy section; `manual` only the /align command and tools; `off` nothing. */
     mode?: AlignmentMode;
     /** Optional deployment-owned policy text replacing the shipped one (auto mode). */
     section?: string;
@@ -70,24 +75,53 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
 /** The assembly context this plugin reads. */
 type AlignmentAssemblyContext = AssembleContext & { agent?: Agent };
 
-/** Human-readable one-line status for the /align command result. */
-export function statusText(status: AlignmentStatus): string {
-    const rounds = status.questionRounds;
-    const manual = status.lastManualCheckAt === undefined
-        ? 'no manual check yet'
-        : `last manual check at ${new Date(status.lastManualCheckAt).toISOString()}`;
-    if (rounds === 0) {
-        return `Requirements Alignment status: no question round yet (${manual}). Starting a direction check now.`;
+/** Human-readable status label for one folded posture. */
+export function statusValueText(value: AlignmentStatusValue): string {
+    switch (value) {
+        case 'aligned': return 'Aligned';
+        case 'drift-pending': return 'Drift pending (an open drift awaits a user decision)';
+        case 'baseline-update-pending': return 'Baseline update pending (a direction change was approved; the new baseline is not recorded yet)';
+        case 'unknown': return 'Unknown (no baseline recorded yet)';
     }
-    return `Requirements Alignment status: ${rounds} question round(s) completed (${manual}). Direction was aligned; starting a fresh check in case a new direction-defining decision appeared.`;
 }
 
 /**
- * The alignment controller: policy section (auto), /align command, and
- * durable per-session state. Provides the `requirementsAlignment` service.
+ * Human-readable multi-line status report for the `/align` command result.
+ * Reports the folded baseline state; it never claims to block execution.
+ */
+export function statusText(status: AlignmentStatus): string {
+    const lines = ['Requirements Alignment', `Baseline revision: ${status.revision}`];
+    lines.push('', 'Goal:', status.baseline?.goal ?? '(none recorded)');
+    const constraints = status.baseline?.explicitConstraints ?? [];
+    lines.push('', 'Protected constraints:');
+    if (constraints.length === 0) {
+        lines.push('(none)');
+    } else {
+        lines.push(...constraints.map((item) => `- ${item}`));
+    }
+    lines.push('', `Drift events: ${status.driftCount}`);
+    if (status.lastDrift === undefined) {
+        lines.push('', 'Last drift:', '(none)');
+    } else {
+        lines.push('', 'Last drift:', `${status.lastDrift.reason} - ${status.lastDrift.description}`);
+    }
+    if (status.lastDecision === undefined) {
+        lines.push('', 'Last user decision:', '(none)');
+    } else {
+        lines.push('', 'Last user decision:', `${status.lastDecision.decision}${status.lastDecision.note === undefined ? '' : ` (${status.lastDecision.note})`}`);
+    }
+    lines.push('', 'Current status:', statusValueText(status.status));
+    lines.push('', `Manual checks: ${status.manualChecks}`);
+    return lines.join('\n');
+}
+
+/**
+ * The alignment controller: policy section (auto), /align command, and the
+ * two model-facing tools (auto + manual). Provides the `requirementsAlignment`
+ * service.
  */
 export class RequirementsAlignmentController extends Service {
-    static inject = ['systemPrompt'];
+    static inject = ['systemPrompt', 'tools'];
 
     /** Validated deployment-owned config. */
     readonly config: ResolvedConfig;
@@ -109,10 +143,15 @@ export class RequirementsAlignmentController extends Service {
             });
         }
 
+        // The tools are inert unless the model calls them; registering them in
+        // manual mode lets the /align steered check drive the same protocol.
+        registerEstablishBaseline(ctx);
+        registerReportDrift(ctx);
+
         ctx.inject(['commands'], (commandCtx) => {
             const definition: CommandDefinition = {
                 name: 'align',
-                description: 'Check whether the current task has unresolved product direction and align it',
+                description: 'Check whether the current execution still matches the requirement baseline',
                 handler: ({ agent, rawInput }) => this.runManualAlignment(agent, rawInput)
             };
             commandCtx.commands.register(definition);
@@ -120,9 +159,9 @@ export class RequirementsAlignmentController extends Service {
     }
 
     /**
-     * Run one manual alignment request: record the check, report the folded
-     * status, and hand the actual direction check to the agent as a steered
-     * user message. Never blocks and never takes over the workflow.
+     * Run one manual alignment inspection: record the check, report the folded
+     * status, and hand a fresh alignment check to the agent as a steered user
+     * message. Never blocks and never takes over the workflow.
      *
      * @param agent The receiving agent.
      * @param _rawInput Unused (bare command); reserved for future arguments.

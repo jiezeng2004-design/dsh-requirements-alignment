@@ -1,0 +1,5 @@
+# Line-ending policy: .gitignore must always check out with LF. A ZIP copy of
+# the working tree must never carry CRLF here (git then reports it as MM on
+# machines without core.autocrlf). Other text files keep the host default.
+*.gitignore text eol=lf
+.gitattributes text eol=lf
