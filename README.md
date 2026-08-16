@@ -56,7 +56,31 @@ dsh plugin --profile web add dsh-requirements-alignment
 
 Use `/align` any time you want to inspect whether the current execution still matches the requirement baseline.
 
-## Enable / disable / uninstall
+## Choose how alignment runs
+
+The plugin exposes `mode: auto | manual | off` through the native DSH / Schemastery Config schema (the settings UI renders the enum). YAML is unchanged:
+
+```yaml
+- id: requirements-alignment
+  config:
+    mode: auto   # auto | manual | off  (default: auto)
+```
+
+**Auto is the recommended default.** Clear tasks run with zero interruption; you are only asked when the execution is about to change direction.
+
+| Mode | Policy section | Alignment tools (`establish_baseline`, `report_drift`) | `/align` |
+|---|---|---|---|
+| **Auto** (recommended) | yes | yes | yes |
+| **Manual** | no | yes | yes |
+| **Off** | no | no | no |
+
+- **Auto** — the drift-guard policy is in every agent's system prompt. The agent records a light baseline when the request carries protected scope, stays silent otherwise, and calls `report_drift` only for a real direction change.
+- **Manual** — no automatic policy. The agent works normally until you run `/align`, which reports status and steers a fresh inspection.
+- **Off** — the plugin stays installed but registers nothing: no policy, no alignment tools, no `/align`.
+
+### Off ≠ Uninstall
+
+`mode: off` leaves the bundle in the profile. The row is still loaded, session history keeps any `alignment/*` events it already appended, and you can switch back to Auto or Manual by changing `mode`. That is not the same as uninstalling.
 
 ```yaml
 # disable the controller only (leaves the ask-user tool mounted)
