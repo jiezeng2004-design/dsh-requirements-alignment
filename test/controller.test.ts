@@ -189,6 +189,7 @@ test('statusText: covers revision 0 and recorded states', () => {
     const fresh = statusText({ revision: 0, driftCount: 0, status: 'unknown', manualChecks: 0 });
     assert.match(fresh, /Baseline revision: 0/);
     assert.match(fresh, /Current status:\nUnknown/);
+    assert.doesNotMatch(fresh, /Mode:/);
     const recorded = statusText({
         revision: 2,
         baseline: { revision: 2, goal: 'g', explicitConstraints: ['c'], updatedAt: 1 },
@@ -202,6 +203,16 @@ test('statusText: covers revision 0 and recorded states', () => {
     assert.match(recorded, /Baseline revision: 2/);
     assert.match(recorded, /Current status:\nAligned/);
     assert.match(recorded, /Manual checks: 1/);
+});
+
+test('statusText: includes Mode: Auto or Mode: Manual from live config, not the fold', () => {
+    const status = { revision: 0, driftCount: 0, status: 'unknown' as const, manualChecks: 0 };
+    const auto = statusText(status, 'auto');
+    const manual = statusText(status, 'manual');
+    assert.match(auto, /^Requirements Alignment\nMode: Auto\nBaseline revision: 0/m);
+    assert.match(manual, /^Requirements Alignment\nMode: Manual\nBaseline revision: 0/m);
+    assert.doesNotMatch(auto, /Mode: Manual/);
+    assert.doesNotMatch(manual, /Mode: Auto/);
 });
 
 test('statusValueText: labels the four postures without gate claims', () => {

@@ -104,12 +104,20 @@ export function statusValueText(value: AlignmentStatusValue): string {
     }
 }
 
+/** Capitalized mode label shown on `/align` (auto and manual only). */
+export function modeStatusLabel(mode: Exclude<AlignmentMode, 'off'>): 'Auto' | 'Manual' {
+    return mode === 'auto' ? 'Auto' : 'Manual';
+}
+
 /**
  * Human-readable multi-line status report for the `/align` command result.
- * Reports the folded baseline state; it never claims to block execution.
+ * Reports the folded baseline state and the active mode; it never claims to
+ * block execution. Mode is taken from the live plugin config, not the fold.
  */
-export function statusText(status: AlignmentStatus): string {
-    const lines = ['Requirements Alignment', `Baseline revision: ${status.revision}`];
+export function statusText(status: AlignmentStatus, mode?: Exclude<AlignmentMode, 'off'>): string {
+    const lines = ['Requirements Alignment'];
+    if (mode !== undefined) lines.push(`Mode: ${modeStatusLabel(mode)}`);
+    lines.push(`Baseline revision: ${status.revision}`);
     lines.push('', 'Goal:', status.baseline?.goal ?? '(none recorded)');
     const constraints = status.baseline?.explicitConstraints ?? [];
     lines.push('', 'Protected constraints:');
@@ -205,7 +213,8 @@ export class RequirementsAlignmentController extends Service {
                 summary: 'Requirements Alignment check started'
             }
         }));
-        return { kind: 'success' as const, text: statusText(status) };
+        const mode = this.config.mode === 'off' ? undefined : this.config.mode;
+        return { kind: 'success' as const, text: statusText(status, mode) };
     }
 }
 
