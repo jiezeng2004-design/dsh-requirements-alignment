@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 $pluginRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $pluginRoot
 $dshHome = Join-Path $workspaceRoot '.dsh-dogfood'
-$profile = 'packed-smoke'
+$profile = 'packed-smoke-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $tempRoot = Join-Path $workspaceRoot '_packed-smoke'
 $recordRoot = Join-Path $pluginRoot 'dogfood\records'
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
@@ -35,13 +35,41 @@ function Add-Check {
     $script:results += $Ok
 }
 
+function Remove-ProfileDir {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    # Deep node_modules trees exceed MAX_PATH; cmd rmdir handles them better than Remove-Item.
+    cmd /c "rmdir /s /q `"$Path`"" | Out-Null
+    if (Test-Path $Path) { Write-Host "cleanup warning: leftover profile still at $Path" }
+}
+
 function Read-Records([string]$Path) {
     if (-not (Test-Path $Path)) { return @() }
     return @(Get-Content $Path | ForEach-Object { $_ | ConvertFrom-Json })
 }
 
-function Get-Phase($records, [string]$Phase) {
-    return @($records | Where-Object { $_.PSObject.Properties.Name -contains 'phase' -and $_.phase -eq $Phase })
+function Get-FirstPhase($records, [string]$Phase) {
+    foreach ($row in @($records)) {
+        if ($null -eq $row) { continue }
+        if ($row.PSObject.Properties.Name -contains 'phase' -and $row.phase -eq $Phase) { return $row }
+    }
+    return $null
+}
+
+function Get-LastPhase($records, [string]$Phase) {
+    $match = $null
+    foreach ($row in @($records)) {
+        if ($null -eq $row) { continue }
+        if ($row.PSObject.Properties.Name -contains 'phase' -and $row.phase -eq $Phase) { $match = $row }
+    }
+    return $match
+}
+
+function Get-Note([object]$Row, [string]$Name) {
+    if ($null -eq $Row) { return $null }
+    $prop = $Row.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $null }
+    return $prop.Value
 }
 
 function Invoke-ModeBoot {
@@ -90,39 +118,41 @@ function Invoke-ModeBoot {
     $exit = $LASTEXITCODE
     Pop-Location
     Add-Check ($exit -eq 0) "$Mode packed profile booted and completed the task (exit $exit)"
-    $records = Read-Records $recordPath
-    $regs = Get-Phase $records 'registrations'
-    $reg = $regs | Select-Object -First 1
-    $regOk = $regs.Count -ge 1 -and $reg.executed
+    $records = @(Read-Records $recordPath)
+    $reg = Get-FirstPhase $records 'registrations'
+    $regOk = $null -ne $reg -and [bool](Get-Note $reg 'executed')
     Add-Check $regOk "$Mode registrations recorded from live registries"
     if ($regOk) {
-        $tools = @($reg.tools)
+        $tools = @()
+        $toolsValue = Get-Note $reg 'tools'
+        if ($null -ne $toolsValue) { $tools = @($toolsValue) }
         $hasTools = ($tools -contains 'establish_baseline') -and ($tools -contains 'report_drift')
-        Add-Check (($reg.policy -eq $ExpectPolicy)) "$Mode policy section present=$ExpectPolicy (assembled system prompt; got $($reg.policy))"
+        $policyValue = [bool](Get-Note $reg 'policy')
+        $alignValue = [bool](Get-Note $reg 'align')
+        Add-Check (($policyValue -eq $ExpectPolicy)) "$Mode policy section present=$ExpectPolicy (assembled system prompt; got $policyValue)"
         Add-Check (($hasTools -eq $ExpectTools)) "$Mode alignment tools present=$ExpectTools (got: $($tools -join ','))"
-        Add-Check (($reg.align -eq $ExpectAlign)) "$Mode /align registered=$ExpectAlign (got $($reg.align))"
+        Add-Check (($alignValue -eq $ExpectAlign)) "$Mode /align registered=$ExpectAlign (got $alignValue)"
     } else {
         Add-Check $false "$Mode policy section present=$ExpectPolicy (no registrations record)"
         Add-Check $false "$Mode alignment tools present=$ExpectTools (no registrations record)"
         Add-Check $false "$Mode /align registered=$ExpectAlign (no registrations record)"
     }
     if ($ExpectAlign) {
-        $align = Get-Phase $records 'align'
-        Add-Check ($align.Count -ge 1 -and $align[0].executed -and $align[0].resultKind -eq 'success') "$Mode /align executed through the real commands registry"
+        $align = Get-FirstPhase $records 'align'
+        Add-Check (($null -ne $align) -and [bool](Get-Note $align 'executed') -and ((Get-Note $align 'resultKind') -eq 'success')) "$Mode /align executed through the real commands registry"
         $modeLabel = if ($Mode -eq 'auto') { 'Mode: Auto' } else { 'Mode: Manual' }
-        Add-Check ($align.Count -ge 1 -and "$($align[0].resultText)" -match [regex]::Escape($modeLabel)) "$Mode /align result includes $modeLabel"
+        Add-Check (($null -ne $align) -and ("$(Get-Note $align 'resultText')" -match [regex]::Escape($modeLabel))) "$Mode /align result includes $modeLabel"
     }
     if ($ExpectTools) {
-        $end = @(Get-Phase $records 'turn-end' | Select-Object -Last 1)
-        Add-Check ($end.Count -eq 1 -and $end[0].baselineRecorded -and $end[0].revision -ge 1) "$Mode establish_baseline worked from the packed install (revision=$($end[0].revision))"
+        $end = Get-LastPhase $records 'turn-end'
+        Add-Check (($null -ne $end) -and [bool](Get-Note $end 'baselineRecorded') -and ([int](Get-Note $end 'revision') -ge 1)) "$Mode establish_baseline worked from the packed install (revision=$(Get-Note $end 'revision'))"
     }
+    $policy = Get-FirstPhase $records 'policy'
     if ($ExpectPolicy) {
-        $policy = Get-Phase $records 'policy'
-        Add-Check ($policy.Count -ge 1 -and $policy[0].executed -and $policy[0].present) "$Mode assembled system prompt contains the requirements-alignment:policy section"
-        Add-Check ($policy.Count -ge 1 -and $policy[0].textHead -match '## Requirements Alignment policy') "$Mode policy section text is the shipped drift-guard policy"
+        Add-Check (($null -ne $policy) -and [bool](Get-Note $policy 'executed') -and [bool](Get-Note $policy 'present')) "$Mode assembled system prompt contains the requirements-alignment:policy section"
+        Add-Check (($null -ne $policy) -and ("$(Get-Note $policy 'textHead')" -match '## Requirements Alignment policy')) "$Mode policy section text is the shipped drift-guard policy"
     } else {
-        $policy = Get-Phase $records 'policy'
-        Add-Check ($policy.Count -ge 1 -and $policy[0].executed -and -not $policy[0].present) "$Mode assembled system prompt has no requirements-alignment:policy section"
+        Add-Check (($null -ne $policy) -and [bool](Get-Note $policy 'executed') -and -not [bool](Get-Note $policy 'present')) "$Mode assembled system prompt has no requirements-alignment:policy section"
     }
 }
 
@@ -177,7 +207,7 @@ if ($null -eq $tarball) {
 
 # ------------------------------------------------- 2. disposable profile
 $dstProfile = Join-Path $dshHome "profiles\$profile"
-if (Test-Path $dstProfile) { Remove-Item $dstProfile -Recurse -Force }
+Remove-ProfileDir $dstProfile
 New-Item -ItemType Directory -Force -Path $dstProfile | Out-Null
 foreach ($file in @('package.json', 'pnpm-workspace.yaml', 'pnpm-lock.yaml', 'cordis.yml', 'cordis.patch.yml')) {
     Copy-Item (Join-Path $srcProfile $file) (Join-Path $dstProfile $file)
@@ -214,7 +244,7 @@ $ls = & $script:dsh plugin --profile $profile ls 2>&1 | Out-String
 Add-Check ($ls -notmatch 'dsh-requirements-alignment') 'profile package list no longer contains the plugin'
 
 # ---------------------------------------------------------------- cleanup
-Remove-Item $dstProfile -Recurse -Force -ErrorAction SilentlyContinue
+try { Remove-ProfileDir $dstProfile } catch { Write-Host "cleanup warning: $($_.Exception.Message)" }
 
 $passed = @($script:results | Where-Object { $_ }).Count
 Write-Host ("PACKED SMOKE SUMMARY: $passed/" + $script:results.Count + " passed")

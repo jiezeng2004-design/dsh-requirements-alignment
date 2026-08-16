@@ -223,19 +223,18 @@ powershell -File scripts/dogfood.ps1 -Benchmark05  # natural benchmark: 3 runs, 
 
 `-FailFast` aborts at the first failed check; `-TimeoutSec <n>` (default 600) is a hard per-scenario timeout that kills the process tree. Scenario tasks for natural-behavior cases (03, 04, 05) contain NO protocol instructions; protocol-forced mechanism cases (01, 06, 07, 08, 09, 10, 11, 12) are reported separately — the natural drift trigger rate is its own metric, never presented as a mechanism verification. The full suite must run under `danger-full-access` (see `docs/PROJECT-MEMORY.md`).
 
-The packed-artifact smoke packs the current tarball, installs it into a disposable profile, boots a real task through it (`/align` executes, `establish_baseline` works, the policy section is present — verified via the assembled system prompt / section registry, not a loose word match), removes it, and verifies the profile restores cleanly:
+The packed-artifact smoke packs the current tarball, installs it into a disposable profile, boots Auto → Manual → Off (`/align`, `establish_baseline`, and the policy section are asserted from the assembled system prompt and live registries — not a loose word match), removes it, and verifies the profile restores cleanly:
 
 ```powershell
 powershell -File scripts/packed-smoke.ps1
 ```
 
-The v0.2.0 release gate verified:
+The v0.2.1 release gate verified:
 
 - Core modifications: **0**
-- Node tests: **84/84 passing**
-- Real DSH dogfood (full correctness suite): **63/63 checks passing** (11 scenarios)
-- Natural drift trigger: **3/4** natural runs fired `report_drift` on their own (04 ×1, 05 ×3)
-- Packed add/rm smoke: **14/14 checks passing** against the current v0.2.0 tarball
+- Node tests: **91/91 passing**
+- Packed add/rm smoke: **34/34** — Auto → Manual → Off against the current v0.2.1 tarball
+- v0.2.0 dogfood baseline (unchanged protocol): **63/63 checks passing** (11 scenarios); natural drift trigger **3/4**
 
 Detailed evidence and the bounded-run caveat are recorded in `ACCEPTANCE.md`.
 
@@ -246,7 +245,7 @@ pnpm install          # dependencies
 pnpm run typecheck    # tsc (src + test)
 pnpm run lint         # eslint (src + test)
 pnpm run build        # tsc → lib/
-pnpm test             # node:test (84 tests)
+pnpm test             # node:test (91 tests)
 pnpm run check        # all of the above
 ```
 

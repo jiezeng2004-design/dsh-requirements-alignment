@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.1 - 2026-08-16
+
+### Added
+
+- **Native mode schema.** The plugin now exports a DSH/Schemastery `Config`
+  schema so the settings UI can render `mode` as an enum (`auto` / `manual` /
+  `off`). YAML stays `mode: auto|manual|off` (default `auto`). `resolveConfig`
+  remains the runtime rule: invalid `mode`, unknown keys, and a blank or
+  non-string `section` still fail at load.
+- **`/align` mode line.** Auto and Manual status text includes `Mode: Auto` or
+  `Mode: Manual`. Off still registers no `/align`.
+- **Three-mode packed smoke.** `scripts/packed-smoke.ps1` installs the current
+  tarball, then boots Auto → Manual → Off and asserts policy / tools / `/align`
+  from the assembled system prompt and live registries before remove restores
+  the profile.
+- **Mode-selection docs.** README adds Choose how alignment runs, the three-mode
+  matrix, Auto as the recommended default, Off ≠ Uninstall, and the wait-for-
+  browser-auth → publish-resumed screenshot (caption limited to what the
+  session log can prove).
+
+### Verification
+
+- Type checking, linting, and build passed.
+- Node tests: 91/91 passing.
+- Packed add/rm smoke: **34/34** — Auto → Manual → Off against the current v0.2.1 tarball.
+
 ## 0.2.0 RC round 2 - 2026-08-16
 
 ### Fixed (release-gate findings)
