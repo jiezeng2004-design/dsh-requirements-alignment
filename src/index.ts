@@ -21,6 +21,7 @@
  * @module dsh-requirements-alignment
  */
 import { Service } from '@deepseek-ai/cordis';
+import Schema from '@deepseek-ai/schemastery';
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
@@ -39,6 +40,9 @@ import type { AlignmentStatus, AlignmentStatusValue } from './types.ts';
 /** Alignment operation mode. */
 export type AlignmentMode = 'auto' | 'manual' | 'off';
 
+/** Legal mode names — the enum the native settings UI renders. YAML stays `mode: auto|manual|off`. */
+export const ALIGNMENT_MODES = ['auto', 'manual', 'off'] as const;
+
 /** Raw plugin config. */
 export interface Config {
     /** `auto` (default) contributes the policy section; `manual` only the /align command and tools; `off` nothing. */
@@ -46,6 +50,21 @@ export interface Config {
     /** Optional deployment-owned policy text replacing the shipped one (auto mode). */
     section?: string;
 }
+
+/**
+ * DSH/Schemastery native Config schema. The settings UI renders `mode` as an
+ * enum (`auto` / `manual` / `off`). YAML stays `mode: auto|manual|off`
+ * (default `auto`). Cordis validates incoming config through this schema's
+ * Standard Schema contract before the plugin starts.
+ */
+export const ConfigSchema = Schema.object({
+    mode: Schema.union(ALIGNMENT_MODES)
+        .default('auto')
+        .description('How alignment runs. Auto contributes the policy section, tools, and /align. Manual keeps tools and /align only. Off registers nothing.'),
+    section: Schema.string()
+        .pattern(/\S/)
+        .description('Optional deployment-owned policy text replacing the shipped one (auto mode). Must be non-empty when set.')
+});
 
 /** A validated, detached config. */
 export interface ResolvedConfig {
@@ -122,6 +141,8 @@ export function statusText(status: AlignmentStatus): string {
  */
 export class RequirementsAlignmentController extends Service {
     static inject = ['systemPrompt', 'tools'];
+    /** Native Config schema (enum `mode`) for the DSH settings UI and Cordis load. */
+    static Config = ConfigSchema;
 
     /** Validated deployment-owned config. */
     readonly config: ResolvedConfig;

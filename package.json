@@ -71,7 +71,8 @@
     "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-tool-ask-user": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-user-questions": "^0.1.0-rc.6"
+    "@deepseek-ai/dsh-user-questions": "^0.1.0-rc.6",
+    "@deepseek-ai/schemastery": "3.18.1"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-agent": "^0.1.0-rc.6"
