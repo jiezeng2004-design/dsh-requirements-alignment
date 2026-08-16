@@ -149,6 +149,14 @@ User:  Approve the direction change — multi-user with accounts and cloud sync.
 Agent: [records the updated baseline (revision advances) and implements]
 ```
 
+## A long task that waits, then continues
+
+When a step needs you, the agent asks and waits instead of guessing. The session below is a real run of a long publish: the log shows the agent asking you to finish browser authorization, then continuing after you did.
+
+![Waiting for browser authorization, then authorization completed and publish resumed](alignment-continuation.png)
+
+What the session log can prove: the agent asked the user to complete browser authorization for publish and waited for an answer; after the user completed authorization, the publish job finished with exit 0 and the session continued. The log does not record a later registry listing or any outcome beyond that job's exit code.
+
 ## Drift taxonomy
 
 The plugin records one of these reasons on every drift candidate:
