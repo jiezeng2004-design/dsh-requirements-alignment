@@ -51,6 +51,13 @@ export interface AlignDriverConfig {
      * (dogfood-only; the product plugin never mounts the driver).
      */
     verifyPolicySection?: boolean;
+    /**
+     * Record the three-mode registration matrix from the live registries:
+     * policy section presence (assembled system prompt), alignment tools
+     * (`establish_baseline`, `report_drift`), and `/align`. Used by the
+     * packed smoke Auto → Manual → Off cycle.
+     */
+    verifyRegistrations?: boolean;
 }
 
 /** A validated, detached config. */
@@ -61,13 +68,14 @@ export interface ResolvedAlignDriverConfig {
     snapshotFirstMutation?: boolean;
     haltAtDecision?: boolean;
     verifyPolicySection?: boolean;
+    verifyRegistrations?: boolean;
 }
 
 /** Validate driver config; unknown keys fail loud. */
 export function resolveAlignDriverConfig(config: AlignDriverConfig = {}): ResolvedAlignDriverConfig {
-    const unknown = Object.keys(config).filter((key) => key !== 'recordPath' && key !== 'runAlign' && key !== 'injectAskUserCall' && key !== 'snapshotFirstMutation' && key !== 'haltAtDecision' && key !== 'verifyPolicySection');
-    if (unknown.length > 0) throw new Error(`AlignDriverConfig has unknown key(s) ${unknown.join(', ')} - config is { recordPath?, runAlign?, injectAskUserCall?, snapshotFirstMutation?, haltAtDecision?, verifyPolicySection? }`);
-    for (const key of ['runAlign', 'injectAskUserCall', 'snapshotFirstMutation', 'haltAtDecision', 'verifyPolicySection'] as const) {
+    const unknown = Object.keys(config).filter((key) => key !== 'recordPath' && key !== 'runAlign' && key !== 'injectAskUserCall' && key !== 'snapshotFirstMutation' && key !== 'haltAtDecision' && key !== 'verifyPolicySection' && key !== 'verifyRegistrations');
+    if (unknown.length > 0) throw new Error(`AlignDriverConfig has unknown key(s) ${unknown.join(', ')} - config is { recordPath?, runAlign?, injectAskUserCall?, snapshotFirstMutation?, haltAtDecision?, verifyPolicySection?, verifyRegistrations? }`);
+    for (const key of ['runAlign', 'injectAskUserCall', 'snapshotFirstMutation', 'haltAtDecision', 'verifyPolicySection', 'verifyRegistrations'] as const) {
         const value = config[key];
         if (value !== undefined && typeof value !== 'boolean') throw new Error(`AlignDriverConfig ${key} must be a boolean`);
     }
@@ -77,7 +85,8 @@ export function resolveAlignDriverConfig(config: AlignDriverConfig = {}): Resolv
         ...(config.injectAskUserCall === undefined ? {} : { injectAskUserCall: config.injectAskUserCall }),
         ...(config.snapshotFirstMutation === undefined ? {} : { snapshotFirstMutation: config.snapshotFirstMutation }),
         ...(config.haltAtDecision === undefined ? {} : { haltAtDecision: config.haltAtDecision }),
-        ...(config.verifyPolicySection === undefined ? {} : { verifyPolicySection: config.verifyPolicySection })
+        ...(config.verifyPolicySection === undefined ? {} : { verifyPolicySection: config.verifyPolicySection }),
+        ...(config.verifyRegistrations === undefined ? {} : { verifyRegistrations: config.verifyRegistrations })
     };
 }
 
@@ -174,6 +183,29 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                 } catch (error) {
                     record(resolved.recordPath, { phase: 'align', executed: false, error: String(error) });
                 }
+            }
+        }
+        if (resolved.verifyRegistrations === true) {
+            try {
+                const tools = ctx.get('tools');
+                const commands = ctx.get('commands');
+                const systemPrompt = ctx.get('systemPrompt');
+                const toolNames = (['establish_baseline', 'report_drift'] as const).filter((name) => tools?.get(name) !== undefined);
+                const align = commands?.find(agent, 'align') !== undefined;
+                let policy = false;
+                if (systemPrompt !== undefined) {
+                    const assembly = await systemPrompt.assemble(assembleContextFor(agent));
+                    policy = assembly.sections.some((entry) => entry.name === POLICY_SECTION);
+                }
+                record(resolved.recordPath, {
+                    phase: 'registrations',
+                    executed: true,
+                    policy,
+                    tools: [...toolNames],
+                    align
+                });
+            } catch (error) {
+                record(resolved.recordPath, { phase: 'registrations', executed: false, error: String(error) });
             }
         }
         if (resolved.verifyPolicySection === true) {

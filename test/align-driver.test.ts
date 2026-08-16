@@ -26,10 +26,12 @@ test('align-driver: accepts the mutation-snapshot, halt, and policy-verify flags
         haltAtDecision: true
     });
     assert.deepEqual(resolveAlignDriverConfig({ verifyPolicySection: true }), { verifyPolicySection: true });
-    assert.deepEqual(resolveAlignDriverConfig({ recordPath: 'r.jsonl', runAlign: true, verifyPolicySection: true }), {
+    assert.deepEqual(resolveAlignDriverConfig({ verifyRegistrations: true }), { verifyRegistrations: true });
+    assert.deepEqual(resolveAlignDriverConfig({ recordPath: 'r.jsonl', runAlign: true, verifyPolicySection: true, verifyRegistrations: true }), {
         recordPath: 'r.jsonl',
         runAlign: true,
-        verifyPolicySection: true
+        verifyPolicySection: true,
+        verifyRegistrations: true
     });
 });
 
@@ -43,4 +45,5 @@ test('align-driver: rejects non-boolean flags', () => {
     assert.throws(() => resolveAlignDriverConfig({ snapshotFirstMutation: 'yes' } as never), /snapshotFirstMutation must be a boolean/);
     assert.throws(() => resolveAlignDriverConfig({ haltAtDecision: 1 } as never), /haltAtDecision must be a boolean/);
     assert.throws(() => resolveAlignDriverConfig({ verifyPolicySection: 'yes' } as never), /verifyPolicySection must be a boolean/);
+    assert.throws(() => resolveAlignDriverConfig({ verifyRegistrations: 'yes' } as never), /verifyRegistrations must be a boolean/);
 });
