@@ -46,10 +46,15 @@ export interface AlignDriverConfig {
      */
     snapshotFirstMutation?: boolean;
     /**
-     * Halt the process right after the first `alignment/decision` event is
-     * appended, so an interrupted session's durable log can be folded at the
-     * decision point (dogfood case 11, phase A). The snapshot is recorded and
-     * the persistence batch is given time to flush before exit.
+     * Halt the process after the first new alignment decision becomes visible
+     * in the canonical alignment state, so an interrupted session's durable
+     * state can be captured at the decision point (dogfood case 11, phase A).
+     * The snapshot is recorded and the persistence batch is given time to
+     * flush before exit.
+     *
+     * In v0.2.2 production appends no `alignment/decision` session events; the
+     * driver observes `lastDecision` from the AlignmentStateStore sidecar (the
+     * legacy fold remains only as a fallback when no store exists).
      */
     haltAtDecision?: boolean;
     /**
@@ -111,7 +116,7 @@ function record(recordPath: string | undefined, line: unknown): void {
     }
 }
 
-/** One folded status snapshot, JSON-safe for the record file. */
+/** One alignment status snapshot, JSON-safe for the record file. */
 function snapshot(status: AlignmentStatus, agent: import('@deepseek-ai/dsh-agent').Agent, phase: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
     return {
         phase,

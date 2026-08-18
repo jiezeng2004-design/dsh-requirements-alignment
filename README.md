@@ -30,8 +30,8 @@ Plan Mode is the official review-approve step *before* implementation. Requireme
 |---|---|
 | System-prompt policy section | In `auto` mode (default) the drift-guard policy is contributed to every agent's prompt at order 60. It teaches the agent to hold a requirement baseline, monitor silently, and detect direction-level drift — scope expansion, constraint conflict, user-visible behavior change, architecture shift, invalidated assumptions, user direction change. |
 | `establish_baseline` tool | Records the baseline (goal, `explicitConstraints`, `mustPreserve`, `allowedScope`, `userDecisions`, `openDirectionDecisions`). Silent — it never asks the user. Recording again bumps the baseline revision. |
-| `report_drift` tool | Records a drift candidate (`reason`, `description`, `requiredChange`), asks you one question through the native user-questions channel, and records your decision. The default approve / stay-within-scope options are always offered; the two defaults map to `approve` / `reject`, a model-supplied alternative direction you pick — or your own free-text answer — maps to `revise` with your exact words as the note, never to a silent rejection. The tool result returns your exact choice (the `note`) and the required baseline change to the agent, so it never re-asks what you picked. Only this plugin's events feed the alignment state — unrelated `ask_user_question` calls (plan mode, other plugins) never pollute it. |
-| `/align` command | Manual entry: reports the folded status (baseline revision, goal, protected constraints, drift count, last drift, last decision, current status) and steers a fresh alignment inspection into the agent. It inspects; it never blocks execution. |
+| `report_drift` tool | Records a drift candidate (`reason`, `description`, `requiredChange`), asks you one question through the native user-questions channel, and records your decision. The default approve / stay-within-scope options are always offered; the two defaults map to `approve` / `reject`, a model-supplied alternative direction you pick — or your own free-text answer — maps to `revise` with your exact words as the note, never to a silent rejection. The tool result returns your exact choice (the `note`) and the required baseline change to the agent, so it never re-asks what you picked. Only alignment state managed by this plugin contributes to the requirement baseline — unrelated `ask_user_question` calls (plan mode, other plugins) never pollute it. |
+| `/align` command | Manual entry: reports the current alignment status (baseline revision, goal, protected constraints, drift count, last drift, last decision, current status) and steers a fresh alignment inspection into the agent. It inspects; it never blocks execution. |
 | Durable state | Canonical alignment state is written to the durable `AlignmentStateStore` sidecar (official `storage-domain` → `storage-json` backend), keyed by session lifecycle identity, so it survives resume, fork, and compaction — and a bare DSH build without this plugin still reads new sessions. The session log itself only ever receives official DSH events; `alignment/*` remains a legacy/migration/fold fallback only. |
 
 ## Installation
@@ -128,7 +128,7 @@ Manual mode contributes no policy section — the agent works normally until you
 /align
 ```
 
-`/align` records the inspection, reports the folded status, and steers a fresh alignment check into the agent (which may then run the drift protocol if it finds a candidate). It never takes over the workflow and never blocks execution.
+`/align` records the inspection, reports the current alignment status, and steers a fresh alignment check into the agent (which may then run the drift protocol if it finds a candidate). It never takes over the workflow and never blocks execution.
 
 ## Example interaction
 
