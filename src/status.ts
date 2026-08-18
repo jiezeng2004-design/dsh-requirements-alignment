@@ -1,13 +1,19 @@
 /**
- * Log folding for Requirements Alignment: derives the durable alignment state
- * of a session from its event log, so resume, fork, and compaction recover
- * the same state without a live mirror. Pure functions only — no service
- * access, no live state.
+ * Log folding for Requirements Alignment — the LEGACY compatibility layer.
  *
- * Compatibility: v0.1 sessions carry `alignment/status` manual-check events
- * and arbitrary `tool/call` records (including `ask_user_question`). The fold
- * counts the former as manual checks and ignores the latter entirely, so old
- * logs fold to a safe all-zero-ish state instead of crashing.
+ * Since the persistence-compatibility fix, canonical alignment state lives in
+ * the AlignmentStateStore sidecar (`src/alignment-state-store.ts`); this
+ * module is kept for:
+ *
+ *   - legacy v0.1/v0.2 session import and migration validation,
+ *   - compatibility fixtures and historical recovery,
+ *   - the store's own derived fallbacks (a parent without a sidecar record
+ *     folds its seed prefix through the exact same rules).
+ *
+ * The fold functions below MUST keep their semantics byte-for-byte stable —
+ * the migration import (`foldLegacyTimeline` in `src/alignment-state.ts`)
+ * mirrors them, so `foldAlignmentStatus(legacyEvents)` and the imported
+ * sidecar state always agree.
  *
  * @module dsh-requirements-alignment/status
  */
@@ -152,31 +158,40 @@ export function foldAlignmentStatus(events: readonly SessionEvent[]): AlignmentS
     };
 }
 
-/** Append the initial baseline (revision >= 1). */
+/**
+ * @deprecated LEGACY-ONLY. The legacy append helpers below exist ONLY for
+ * compatibility tests and migration fixtures. Production code MUST NOT call
+ * them: appending `alignment/*` events to a live session makes the persisted
+ * log unreadable to every DSH build (the generated `KNOWN_SESSION_EVENT_TYPES`
+ * does not contain them). Use AlignmentStateStore (`recordBaseline`,
+ * `recordDrift`, `recordDecision`, `recordManualCheck`) instead.
+ */
+
+/** @internal legacy-only — append the initial baseline (revision >= 1). */
 export function appendBaseline(session: AlignmentLog, baseline: RequirementBaseline): void {
     session.append('alignment/baseline', { baseline });
 }
 
-/** Append a revised baseline (whole-value replace, revision increments). */
+/** @internal legacy-only — append a revised baseline (whole-value replace, revision increments). */
 export function appendBaselineUpdated(session: AlignmentLog, baseline: RequirementBaseline): void {
     session.append('alignment/baseline-updated', { baseline });
 }
 
 /**
- * Append one drift candidate and return the logged event, so the caller can
- * pair the later decision by `event.seq`.
+ * @internal legacy-only — append one drift candidate and return the logged
+ * event, so the caller can pair the later decision by `event.seq`.
  */
 export function appendDrift(session: AlignmentLog, data: DriftEvent): SessionEvent<'alignment/drift'> {
     return session.append('alignment/drift', data);
 }
 
-/** Append one user decision on a drift candidate. */
+/** @internal legacy-only — append one user decision on a drift candidate. */
 export function appendDecision(session: AlignmentLog, data: DecisionEvent): void {
     session.append('alignment/decision', data);
 }
 
 /**
- * Append one manual `/align` inspection.
+ * @internal legacy-only — append one manual `/align` inspection.
  *
  * @param session The session (or double) to append to.
  * @param at Epoch milliseconds of the check; defaults to now.

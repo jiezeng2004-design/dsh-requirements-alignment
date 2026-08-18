@@ -4,15 +4,23 @@
  *
  * While an agent executes, the plugin keeps a durable requirement baseline
  * per session (goal, explicit constraints, must-preserve behavior, allowed
- * scope, settled user decisions) folded from dedicated `alignment/*` session
- * events. Auto mode (default) contributes a policy section to every agent's
- * system prompt that teaches silent drift detection and the re-alignment
- * protocol, plus two model-facing tools: `establish_baseline` (silent
- * baseline recording) and `report_drift` (drift candidate + user decision).
- * Manual mode contributes no section; the `/align` command steers a compact
- * fresh-alignment inspection into the agent. Both modes record durable
- * per-session state that survives resume, fork, and compaction (pure folds
- * over the log — no live mirror).
+ * scope, settled user decisions) in the AlignmentStateStore sidecar — the
+ * official `ctx.storageDomain` KV domain — NOT in session events. Since the
+ * persistence-compatibility fix, production code never appends `alignment/*`
+ * events: the DSH persistence reader's generated known-event vocabulary does
+ * not contain them, and an appended event makes the session unreadable to
+ * every DSH build (SessionFormatUnsupportedError). New sessions created by
+ * this plugin load, replay, and resume under a bare DSH reader with zero
+ * alignment footprint. Auto mode (default) contributes a policy section to
+ * every agent's system prompt that teaches silent drift detection and the
+ * re-alignment protocol, plus two model-facing tools: `establish_baseline`
+ * (silent baseline recording) and `report_drift` (drift candidate + user
+ * decision). Manual mode contributes no section; the `/align` command steers
+ * a compact fresh-alignment inspection into the agent. Both modes record
+ * durable per-session state that survives resume, historical fork, and
+ * compaction through whole-state checkpoints (`{visibleThroughSeq, state}`),
+ * and `/align-migrate` repairs legacy sessions whose artifacts still carry
+ * alignment/* events.
  *
  * The plugin is a plain Cordis service: every registration is an effect
  * disposer owned by this fiber, so unloading the plugin (or disabling the
@@ -22,26 +30,26 @@
  */
 import { Service } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
-import type { CommandDefinition } from '@deepseek-ai/dsh-commands';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
-import type { AssembleContext } from '@deepseek-ai/dsh-system-prompt';
 import type { Agent } from '@deepseek-ai/dsh-agent';
+import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands';
+import type { AssembleContext } from '@deepseek-ai/dsh-system-prompt';
+import { MANUAL_CHECK_MESSAGE, POLICY_ORDER, POLICY_SECTION, autoPolicyText } from './policy.ts';
+import { AlignmentStateStore } from './alignment-state-store.ts';
+import { migrateLegacyArtifact } from './migration.ts';
 import { registerEstablishBaseline, registerReportDrift } from './baseline-tool.ts';
 import {
-    MANUAL_CHECK_MESSAGE,
-    POLICY_ORDER,
-    POLICY_SECTION,
-    autoPolicyText
-} from './policy.ts';
-import { appendManualCheck, foldAlignmentStatus } from './status.ts';
-import type { AlignmentStatus, AlignmentStatusValue } from './types.ts';
+    ALIGNMENT_MODES,
+    type AlignmentMode,
+    type AlignmentStatus,
+    type AlignmentStatusValue
+} from './types.ts';
 
 /** Alignment operation mode. */
-export type AlignmentMode = 'auto' | 'manual' | 'off';
-
-/** Legal mode names used by the configuration schema and load validation. YAML stays `mode: auto|manual|off`. */
-export const ALIGNMENT_MODES = ['auto', 'manual', 'off'] as const;
+export type { AlignmentMode };
+export { ALIGNMENT_MODES };
 
 /** Raw plugin config. */
 export interface Config {
@@ -91,9 +99,6 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     return config.section === undefined ? { mode } : { mode, section: config.section };
 }
 
-/** The assembly context this plugin reads. */
-type AlignmentAssemblyContext = AssembleContext & { agent?: Agent };
-
 /** Human-readable status label for one folded posture. */
 export function statusValueText(value: AlignmentStatusValue): string {
     switch (value) {
@@ -142,10 +147,15 @@ export function statusText(status: AlignmentStatus, mode?: Exclude<AlignmentMode
     return lines.join('\n');
 }
 
+/** The assembly context this plugin reads. */
+type AlignmentAssemblyContext = AssembleContext & { agent?: Agent };
+
 /**
- * The alignment controller: policy section (auto), /align command, and the
- * two model-facing tools (auto + manual). Provides the `requirementsAlignment`
- * service.
+ * The alignment controller: policy section (auto), the `/align` and
+ * `/align-migrate` commands, and the two model-facing tools (auto + manual).
+ * Provides the `requirementsAlignment` service, whose `stateStore` is the
+ * canonical alignment state (the durable sidecar) read by the dogfood align
+ * driver and by this controller's own `/align` path.
  */
 export class RequirementsAlignmentController extends Service {
     static inject = ['systemPrompt', 'tools'];
@@ -154,10 +164,13 @@ export class RequirementsAlignmentController extends Service {
 
     /** Validated deployment-owned config. */
     readonly config: ResolvedConfig;
+    /** The canonical alignment state store (durable sidecar + in-memory view). */
+    readonly stateStore: AlignmentStateStore;
 
     constructor(ctx: import('@deepseek-ai/cordis').Context, config: Config = {}) {
         super(ctx, 'requirementsAlignment');
         this.config = resolveConfig(config);
+        this.stateStore = new AlignmentStateStore(ctx, { logger: this.ctx.logger });
         if (this.config.mode === 'off') return;
 
         if (this.config.mode === 'auto') {
@@ -167,40 +180,65 @@ export class RequirementsAlignmentController extends Service {
                 text: (context: AlignmentAssemblyContext) => {
                     const agent = context.agent;
                     if (agent === undefined) return '';
-                    return autoPolicyText(this.config.section, foldAlignmentStatus(agent.session.events));
+                    // The authoritative in-memory view of the sidecar store —
+                    // the hot path never touches the medium.
+                    return autoPolicyText(this.config.section, this.stateStore.getStatus(agent.session));
                 }
             });
         }
 
         // The tools are inert unless the model calls them; registering them in
         // manual mode lets the /align steered check drive the same protocol.
-        registerEstablishBaseline(ctx);
-        registerReportDrift(ctx);
+        registerEstablishBaseline(ctx, this.stateStore);
+        registerReportDrift(ctx, this.stateStore);
 
         ctx.inject(['commands'], (commandCtx) => {
-            const definition: CommandDefinition = {
+            const alignDefinition: CommandDefinition = {
                 name: 'align',
                 description: 'Check whether the current execution still matches the requirement baseline',
                 handler: ({ agent, rawInput }) => this.runManualAlignment(agent, rawInput)
             };
-            commandCtx.commands.register(definition);
+            const migrateDefinition: CommandDefinition = {
+                name: 'align-migrate',
+                description: 'Migrate a legacy session artifact: mark the plugin\'s old alignment/* events ignorable so any DSH build can open it (explicit, gated, idempotent)',
+                handler: ({ agent, rawInput }) => this.runMigrate(agent, rawInput)
+            };
+            commandCtx.commands.register(alignDefinition);
+            commandCtx.commands.register(migrateDefinition);
         });
     }
 
     /**
-     * Run one manual alignment inspection: record the check, report the folded
-     * status, and hand a fresh alignment check to the agent as a steered user
-     * message. Never blocks and never takes over the workflow.
+     * Awaited plugin startup hook (Cordis `Service.init`): opens the
+     * alignment sidecar domain (durable records land in memory before any
+     * session can exist) and adopts every session as it starts — importing
+     * legacy timelines and pinning fork inheritance idempotently.
+     */
+    async [Service.init](): Promise<void> {
+        await this.stateStore.open();
+        this.ctx.on('agent/session-start', (payload: { agent: Agent }) => {
+            void this.stateStore.initializeSession(payload.agent.session).catch((error: unknown) => {
+                this.ctx.logger?.warn('requirements-alignment: failed to initialize alignment state for a session: %o', error);
+            });
+        });
+    }
+
+    /**
+     * Run one manual alignment inspection: record the check in the sidecar,
+     * report the folded status, and hand a fresh alignment check to the agent
+     * as a steered user message. Never blocks and never takes over the
+     * workflow. A failed manual-check record (e.g. no durable medium) is
+     * logged and never prevents the inspection itself from running.
      *
      * @param agent The receiving agent.
      * @param _rawInput Unused (bare command); reserved for future arguments.
      * @returns The command result rendered by the dispatching UI.
      */
-    runManualAlignment(agent: Agent, _rawInput: string) {
-        const status = foldAlignmentStatus(agent.session.events);
+    async runManualAlignment(agent: Agent, _rawInput: string): Promise<CommandResult> {
+        const status = this.stateStore.getStatus(agent.session);
         const session: Session = agent.session;
         try {
-            appendManualCheck(session);
+            await this.stateStore.recordManualCheck(session);
         } catch (error) {
             this.ctx.logger?.warn('requirements-alignment: failed to record manual check: %o', error);
         }
@@ -215,6 +253,50 @@ export class RequirementsAlignmentController extends Service {
         }));
         const mode = this.config.mode === 'off' ? undefined : this.config.mode;
         return { kind: 'success' as const, text: statusText(status, mode) };
+    }
+
+    /**
+     * The `/align-migrate` command body: run the explicit, gated legacy
+     * artifact migration for one stored session. The session id comes from
+     * the command input; without one, the calling agent's own session id is
+     * used. Errors (live writer, missing artifact, any failed safety gate)
+     * are reported as command errors and never touch the artifact.
+     *
+     * @param agent The receiving agent (whose session id is the default target).
+     * @param rawInput The command input (a session id, when given).
+     * @returns The command result rendered by the dispatching UI.
+     */
+    async runMigrate(agent: Agent, rawInput: string): Promise<CommandResult> {
+        const persistence = this.ctx.get('sessionPersistence');
+        if (persistence === undefined) {
+            return { kind: 'error' as const, text: 'No session persistence service is mounted; cannot migrate stored sessions.' };
+        }
+        const target = rawInput.trim();
+        const id = target === '' ? String(agent.session.id) : target;
+        try {
+            const report = await migrateLegacyArtifact(SessionId(id), {
+                persistence,
+                sessions: this.ctx.get('sessions')
+            });
+            if (!report.migrated) {
+                return {
+                    kind: 'success' as const,
+                    text: `Session ${report.id}: nothing to repair — no unmarked legacy alignment events. Artifact unchanged.`
+                };
+            }
+            return {
+                kind: 'success' as const,
+                text: `Session ${report.id} migrated: ${report.repairedEvents} legacy alignment event(s) marked ignorable.`
+                    + `\nOriginal SHA-256: ${report.originalSha256}`
+                    + `\nBackup: ${report.backupPath ?? '(none)'}`
+                    + `\nThe session can now be opened by any DSH build.`
+            };
+        } catch (error) {
+            return {
+                kind: 'error' as const,
+                text: `Migration failed for ${id}: ${error instanceof Error ? error.message : String(error)}`
+            };
+        }
     }
 }
 

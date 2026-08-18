@@ -10,9 +10,35 @@ v0.2.0 is the **runtime requirement drift guard** rewrite:
 > Requirements Alignment prevents a good plan from drifting.
 
 The plugin maintains a durable requirement baseline during execution, detects
-direction-level drift through policy, re-aligns with the user through a
-dedicated `report_drift` tool, and records every candidate/decision as
-log-only session events folded by pure functions.
+direction-level drift through policy, and re-aligns with the user through a
+dedicated `report_drift` tool. Since the persistence-compatibility fix,
+canonical alignment state is written by the `AlignmentStateStore` sidecar (an
+official `storage-domain` → `storage-json` domain), **not** as session events.
+The `alignment/*` event vocabulary is kept only as a legacy/migration/fold
+fallback, and production never appends it to a live session log.
+
+## Persistence-compatibility fix architecture (0.2.2)
+
+DSH Session log → official DSH-recognizable events only (a bare DSH build
+without this plugin still reads any new session).
+
+Alignment canonical state → `AlignmentStateStore` → `storage-domain` →
+`storage-json` backend, keyed by session lifecycle identity
+(`{ id, createdAt, cwd }`), with durable-first mutations and
+checkpoint/`visibleThroughSeq` semantics supporting resume, historical fork,
+lineage inheritance, and compaction.
+
+`alignment/*` is kept only for legacy compatibility, legacy migration, test
+fixtures, and the fold fallback (a parent without a sidecar record folds its
+seed prefix). Production paths append zero `alignment/*` session events.
+
+The dogfood align driver reads this sidecar through the `requirementsAlignment`
+service and resolves the store **lazily** on every snapshot: it never captures
+the store at `apply()` time, so a driver mounted before the controller appears
+starts reading the durable sidecar the moment the controller does — dogfood 03
+(`baseline recorded`, `revision >= 1`) is decided by the sidecar, never by a
+revision-0 legacy fold. When no store ever exists, the legacy fold remains the
+fallback.
 
 ## RC fix answers (release-candidate round)
 
@@ -75,12 +101,12 @@ log-only session events folded by pure functions.
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
 | 1 | Independent plugin (no DSH Core changes) | ✅ | `Core modifications: 0`. No `@deepseek-ai/*` file touched. `ctx.planMode` untouched; `exit_plan_mode` untouched. |
-| 2 | New event schema | ✅ | `alignment/baseline`, `alignment/baseline-updated`, `alignment/drift`, `alignment/decision`, `alignment/manual-check` via `SessionEventMap` augmentation; legacy `alignment/status` read-only. All log-only (non-surface). |
+| 2 | Legacy event schema (read compatibility) | ✅ | `alignment/baseline`, `alignment/baseline-updated`, `alignment/drift`, `alignment/decision`, `alignment/manual-check` declared via `SessionEventMap` augmentation + legacy `alignment/status` read-only. These are the LEGACY vocabulary only — canonical state now lives in the `AlignmentStateStore` sidecar, and production appends none of these to a live session (a bare DSH reader stays compatible). |
 | 3 | Requirement Baseline model | ✅ | `{ revision, goal?, explicitConstraints?, mustPreserve?, allowedScope?, userDecisions?, openDirectionDecisions?, updatedAt }`; whole-value replace; minimal by design. |
 | 4 | Drift detection policy | ✅ | System-prompt section (order 60) teaches silent monitoring + the 8-reason taxonomy + the drift protocol; explicit scope/preservation constraints demand a silent baseline BEFORE the first mutation; per-session baseline summary rendered from the fold. |
 | 5 | Baseline revision mechanism | ✅ | `establish_baseline` records v1 and bumps revision on every later whole-value update; dogfood case 5 (architecture shift) showed `0 → 1`, dogfood case 8 (subagent) showed `0 → 2` — matching the real records. |
 | 6 | Decision mapping | ✅ | Default options → `approve`/`reject`; model-supplied option picked → `revise` + chosen label as note; free text → `revise` + user words; uninterpretable → fail loud (never silent `reject`). Unit + dogfood case 09. |
-| 7 | Durability state machine | ✅ | Fold distinguishes `unknown` / `aligned` / `drift-pending` / `baseline-update-pending`; pure log fold (no live mirror). Approve-interruption dogfood case 11: the persisted on-disk session log folds to `baseline-update-pending`; a simulated post-resume `establish_baseline` yields `aligned`, revision +1. |
+| 7 | Durability state machine | ✅ | `AlignmentStateStore` derives `unknown` / `aligned` / `drift-pending` / `baseline-update-pending` from durable sidecar checkpoints (durable-first: validate → durable put → memory commit — no live mirror that can diverge). The legacy log fold (`foldAlignmentStatus`) stays byte-identical purely for migration and fold-fallback equivalence. Approve-interruption case 11: the persisted state folds to `baseline-update-pending`; a simulated post-resume `establish_baseline` yields `aligned`, revision +1. |
 | 8 | Validation ordering | ✅ | `report_drift` validates all args + channel prerequisite before appending; invalid input → tool fails with `alignment/drift` count 0 (unit + dogfood case 10). |
 | 9 | `/align` new behavior | ✅ | Appends `alignment/manual-check`, folds status (incl. `baseline-update-pending`), returns revision/goal/constraints/drift count/last drift/last decision/status; steers a fresh check; never a gate. |
 | 10 | Plan Mode compatibility | ✅ | No interaction with plan mode; policy defers to it while active; plan-mode's own `ask_user_question`/`exit_plan_mode` calls never pollute alignment state (verified by the isolation case). |
@@ -233,15 +259,17 @@ and package list clean → disposable profile removed).
 | `ctx.userQuestions.ask()` | the drift question (native channel, agent + signal attached) |
 | `ctx.commands.register()` | `/align` (exact `CommandDefinition` contract) |
 | `agent.steer()` + `createUserMessage` | `/align` hands the fresh check to the agent |
-| `session.append()` + `SessionEventMap` augmentation | durable `alignment/*` events |
+| `ctx.storageDomain` (open domain table) | canonical state: `AlignmentStateStore` durable sidecar (`storage-domain` → `storage-json`) |
+| `session.append()` + `SessionEventMap` augmentation | LEGACY vocabulary only — kept for read compatibility / migration / fold-fallback; production never appends `alignment/*` |
 | `agent/session-start`, `session/event` (driver) | dogfood-only snapshots (start / first mutation / halted decision / turn end) + `/align` executor + real system-prompt assembly for the policy-section registry check (`verifyPolicySection`) |
 | `ctx.inject(['commands'])` | optional dependency pattern (as `dsh-plan-mode`) |
 | bundle patch layers | install/remove via `dsh plugin add/rm` |
 
 **B. Fully plugin-implemented:** baseline model + revision, drift taxonomy and
-protocol, both tools, dedicated events + pure folds, `/align` inspection,
-auto/manual/off modes, config validation, policy + baseline summary rendering,
-the scripted-answer E2E provider (incl. `optionMatch`), the align driver.
+protocol, both tools, the `AlignmentStateStore` durable sidecar + legacy fold
+layer, `/align` inspection, auto/manual/off modes, config validation, policy +
+baseline summary rendering, the scripted-answer E2E provider (incl.
+`optionMatch`), the align driver.
 
 **C. DSH API limitations encountered:**
 

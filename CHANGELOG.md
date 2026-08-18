@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.2 - 2026-08-18
+
+### Changed (DSH rc.6 persistence compatibility)
+
+- **Canonical alignment state moved out of the Session event log.** The DSH
+  Session log now carries official DSH-recognizable events only; canonical
+  alignment state lives in the durable `AlignmentStateStore` sidecar — an
+  official `storage-domain` → `storage-json` backend domain keyed by session
+  lifecycle identity (`{ id, createdAt, cwd }`). A bare DSH build without this
+  plugin still reads any new session.
+- **Storage-domain durable sidecar.** Whole-state checkpoints
+  (`{ visibleThroughSeq, state }`) with durable-first mutations: validate →
+  durable put → memory commit, so a failed durable write surfaces and never
+  leaves a divergent live view.
+- **Resume / historical fork / compaction support.** Sidecar checkpoints
+  restore identical state on cold load, inherit the state in force at a
+  historical `seedLength - 1` boundary, and survive compaction.
+- **Legacy `alignment/*` migration.** The `alignment/*` event vocabulary is
+  kept only as legacy compatibility / legacy migration / test fixture / fold
+  fallback; production paths append zero `alignment/*` session events.
+- **statusCache session-identity isolation fix.** `AlignmentStateStore`'s
+  derived-status cache is now bound to the lifecycle identity
+  (`id + createdAt + cwd`) that produced it, matching the record lookup's
+  identity rule. A cached status only hits when the identity matches, so a
+  session id reused by a different lifecycle can never leak stale alignment
+  state through the cache, and lineage inheritance for a reused-id fork is no
+  longer suppressed by a stale cached status.
+- **Align-driver lifecycle regression fix.** The dogfood align driver no
+  longer captures the `requirementsAlignment` store eagerly at `apply()` time:
+  it re-resolves the store on every status read, so a driver mounted before
+  the controller (and its sidecar) appears reads the durable sidecar revision
+  instead of permanently falling back to the legacy session-log fold
+  (revision 0). The legacy fold remains the fallback when no store ever
+  exists.
+
+### Verification
+
+- Type checking, linting, and build passed.
+- Node tests: 133/133 passing (2 statusCache identity + 3 align-driver
+  lazy-resolution regressions).
+- Targeted persistence / migration / store regression suites pass (29/29).
+- Real dogfood 01-greenfield / 02-typo / 03-bugfix pass (03 asserts
+  `baseline recorded` + `revision >= 1` from the sidecar).
+- `npm pack --dry-run` passes (exports targets all present; no v0.3.0
+  runtime-mode / hot-switch files; no test artifacts).
+
 ## 0.2.1 - 2026-08-16
 
 ### Added

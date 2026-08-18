@@ -2,22 +2,26 @@
  * The model-facing alignment tools: `establish_baseline` (silent baseline
  * recording / revision) and `report_drift` (drift candidate + user
  * re-alignment). Both are the plan-mode pattern — a plugin-owned tool over
- * the native `ctx.userQuestions` seam — so the alignment state is written
- * only by this plugin's own events and can never be confused with unrelated
- * `ask_user_question` calls.
+ * the native `ctx.userQuestions` seam.
+ *
+ * State writes go through {@link AlignmentStateStore} — the durable sidecar —
+ * NEVER through session events: appending `alignment/*` events would make the
+ * persisted log unreadable to every DSH build (the generated known-event
+ * vocabulary does not contain them). The drift flow keeps its original safety
+ * ordering:
+ *
+ *   validate -> record drift durable -> ask the user -> record decision
+ *   durable -> (the agent then calls establish_baseline when approved)
+ *
+ * so an interruption between any two steps leaves exactly the durable state
+ * the legacy fold used to derive (drift-pending / baseline-update-pending).
  *
  * @module dsh-requirements-alignment/baseline-tool
  */
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { UserQuestionError } from '@deepseek-ai/dsh-user-questions';
-import {
-    appendBaseline,
-    appendBaselineUpdated,
-    appendDecision,
-    appendDrift,
-    foldRequirementBaseline
-} from './status.ts';
+import type { AlignmentStateStore } from './alignment-state-store.ts';
 import {
     DRIFT_REASONS,
     type AlignmentDecisionKind,
@@ -231,8 +235,8 @@ export function mapDriftAnswer(
 }
 
 /** The `establish_baseline` tool: silent, never asks the user. */
-export function registerEstablishBaseline(ctx: import('@deepseek-ai/cordis').Context): void {
-    ctx.tools.register(defineTool({
+export function registerEstablishBaseline(ctx: import('@deepseek-ai/cordis').Context, store: AlignmentStateStore): () => void {
+    return ctx.tools.register(defineTool({
         name: 'establish_baseline',
         description: 'Record the requirement baseline of the current task (goal, explicit constraints, must-preserve behavior, allowed scope, settled user decisions). Silent: it never asks the user. Call it once when the task carries direction-relevant constraints or after the user settles a direction decision; the baseline revision advances on every call.',
         parameters: {
@@ -267,21 +271,19 @@ export function registerEstablishBaseline(ctx: import('@deepseek-ai/cordis').Con
             const agent = requireCallingAgent(exec, 'establish_baseline');
             const input = validateBaselineInput(args.baseline);
             const session = agent.session;
-            const current = foldRequirementBaseline(session.events);
+            // The current baseline comes from the durable sidecar (the
+            // authoritative view), never from a session-event fold.
+            const current = store.getBaseline(session);
             const baseline = buildBaseline(input, current, Date.now());
-            if (current === undefined) {
-                appendBaseline(session, baseline);
-            } else {
-                appendBaselineUpdated(session, baseline);
-            }
+            await store.recordBaseline(session, baseline);
             return { revision: baseline.revision };
         }
     }));
 }
 
 /** The `report_drift` tool: record a drift candidate, ask the user, record the decision. */
-export function registerReportDrift(ctx: import('@deepseek-ai/cordis').Context): void {
-    ctx.tools.register(defineTool({
+export function registerReportDrift(ctx: import('@deepseek-ai/cordis').Context, store: AlignmentStateStore): () => void {
+    return ctx.tools.register(defineTool({
         name: 'report_drift',
         description: 'Report that continuing the task would materially change the requirement baseline (scope expansion, constraint conflict, user-visible behavior change, architecture shift, data-model change, compatibility change, invalidated assumption, or user direction change). Records the candidate, asks the user for the decision, and records it. Call it BEFORE taking the direction-changing action - never silently proceed. When the change offers a genuine choice of directions, pass the distinct candidates as options: the user\'s chosen option records as a revised direction (note = the chosen option label), never a rejection. The approve / stay-within-scope options are always offered alongside, so the user can always approve or reject explicitly.',
         parameters: {
@@ -342,17 +344,20 @@ export function registerReportDrift(ctx: import('@deepseek-ai/cordis').Context):
         execute: async (args, exec) => {
             const agent = requireCallingAgent(exec, 'report_drift');
             // Validate every argument BEFORE any durable write: an input error
-            // discoverable here must never pollute the session log.
+            // discoverable here must never leave partial state behind.
             const validated = validateDriftArgs(args);
             const session = agent.session;
-            // Validate the interaction prerequisites before appending the
+            // Validate the interaction prerequisites before recording the
             // drift candidate: without a question channel the tool must fail
-            // with a clean log, not a stranded drift event.
+            // with no durable residue, not a stranded drift.
             const interaction = ctx.get('userQuestions');
             if (interaction === undefined) throw new Error('no user-questions channel is available to re-align the requirement baseline; ask the user to run /align instead');
             const presented = withDefaultOptions(validated.options ?? [...DEFAULT_DRIFT_OPTIONS]);
             const now = Date.now();
-            const drift = appendDrift(session, {
+            // Durable first: the candidate is recorded in the sidecar BEFORE
+            // any user interaction, so a cancelled or failed question still
+            // leaves the drift durable (drift-pending on resume).
+            const { driftSeq } = await store.recordDrift(session, {
                 reason: validated.reason,
                 description: validated.description,
                 ...(validated.requiredChange === undefined ? {} : { requiredChange: validated.requiredChange }),
@@ -387,8 +392,8 @@ export function registerReportDrift(ctx: import('@deepseek-ai/cordis').Context):
             const item = answer.answers.find((entry) => entry.id === DRIFT_QUESTION_ID);
             // Fail loud on an uninterpretable answer; never silently reject.
             const mapped = mapDriftAnswer(item?.selected ?? [], item?.custom, presented);
-            appendDecision(session, {
-                driftSeq: drift.seq,
+            await store.recordDecision(session, {
+                driftSeq,
                 decision: mapped.decision,
                 ...(mapped.note === undefined ? {} : { note: mapped.note }),
                 at: Date.now()

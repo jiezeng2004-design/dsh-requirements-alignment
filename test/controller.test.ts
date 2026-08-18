@@ -10,23 +10,7 @@ import {
 import { POLICY_ORDER, POLICY_SECTION } from '../src/policy.ts';
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands';
 import type { PromptSection } from '@deepseek-ai/dsh-system-prompt';
-
-/** A minimal live agent double with a real event log array. */
-function fakeAgent() {
-    const events: Array<{ seq: number; type: string; data: unknown }> = [];
-    const steered: unknown[] = [];
-    const agent = {
-        session: {
-            events: events as never,
-            append: (type: string, data: unknown) => {
-                events.push({ seq: events.length, type, data });
-                return { type, data, seq: events.length - 1, time: 0 };
-            }
-        },
-        steer: (message: unknown) => steered.push(message)
-    };
-    return { agent, events, steered };
-}
+import { fakeSession, fakeStorageDomain } from './helpers.ts';
 
 /** Mount the controller with fake systemPrompt/commands/tools services. */
 async function mount(config: object) {
@@ -68,32 +52,49 @@ async function mount(config: object) {
             return disposer;
         }
     });
+    // The storage-domain seam: the store attaches to it (as in the web
+    // profile), so alignment writes are durable within the test process.
+    const storage = fakeStorageDomain();
+    ctx.provide('storageDomain', storage);
     await ctx.plugin(RequirementsAlignmentController, config);
-    // The controller registers its command through ctx.inject, which starts a
+    // The controller registers its commands through ctx.inject, which starts a
     // dependent fiber on a later microtask.
     await new Promise((resolve) => setTimeout(resolve, 20));
-    return { ctx, sections, commands, tools, disposers };
+    const controller = (ctx as unknown as { requirementsAlignment: RequirementsAlignmentController }).requirementsAlignment;
+    return { ctx, controller, sections, commands, tools, disposers };
 }
 
-test('controller: auto mode registers the policy section, /align, and both tools', async () => {
+/** The /align command (auto/manual registration). */
+function alignCommand(commands: CommandDefinition[]): CommandDefinition {
+    const found = commands.find((command) => command.name === 'align');
+    assert.ok(found, '/align must be registered');
+    return found;
+}
+
+test('controller: auto mode registers the policy section, both commands, and both tools', async () => {
     const { sections, commands, tools } = await mount({ mode: 'auto' });
     assert.equal(sections.length, 1);
     assert.equal(sections[0]!.name, POLICY_SECTION);
     assert.equal(sections[0]!.order, POLICY_ORDER);
-    assert.equal(commands.length, 1);
-    assert.equal(commands[0]!.name, 'align');
+    assert.deepEqual(commands.map((command) => command.name).sort(), ['align', 'align-migrate']);
     assert.deepEqual(tools.map((tool) => tool.name).sort(), ['establish_baseline', 'report_drift']);
 });
 
 test('controller: section text renders the full policy on a fresh session and the baseline summary once recorded', async () => {
-    const { sections } = await mount({ mode: 'auto' });
-    const { agent, events } = fakeAgent();
+    const { sections, controller } = await mount({ mode: 'auto' });
+    const { session } = fakeSession();
     const text = sections[0]!.text as (context: unknown) => string;
-    const fresh = text({ agent });
+    const fresh = text({ agent: { session } });
     assert.match(fresh, /Requirements Alignment policy/);
     assert.doesNotMatch(fresh, /Current requirement baseline/);
-    events.push({ seq: 0, type: 'alignment/baseline', data: { baseline: { revision: 1, goal: 'Fix the form bug', explicitConstraints: ['no UI change'], updatedAt: 1 } } });
-    const withBaseline = text({ agent });
+    // The summary reads the sidecar store (the canonical view), not events.
+    await controller.stateStore.recordBaseline(session, {
+        revision: 1,
+        goal: 'Fix the form bug',
+        explicitConstraints: ['no UI change'],
+        updatedAt: 1
+    });
+    const withBaseline = text({ agent: { session } });
     assert.match(withBaseline, /Current requirement baseline \(revision 1\):/);
     assert.match(withBaseline, /Goal: Fix the form bug/);
 });
@@ -104,11 +105,10 @@ test('controller: section renders nothing without an agent (bare assemble)', asy
     assert.equal(text({}), '');
 });
 
-test('controller: manual mode registers only the command and tools, no section', async () => {
+test('controller: manual mode registers only the commands and tools, no section', async () => {
     const { sections, commands, tools } = await mount({ mode: 'manual' });
     assert.equal(sections.length, 0);
-    assert.equal(commands.length, 1);
-    assert.equal(commands[0]!.name, 'align');
+    assert.deepEqual(commands.map((command) => command.name).sort(), ['align', 'align-migrate']);
     assert.deepEqual(tools.map((tool) => tool.name).sort(), ['establish_baseline', 'report_drift']);
 });
 
@@ -121,17 +121,20 @@ test('controller: off mode registers nothing', async () => {
 
 test('controller: unload disposes every registration', async () => {
     const { sections, commands, tools, disposers } = await mount({ mode: 'auto' });
-    assert.ok(disposers.length >= 4);
+    assert.ok(disposers.length >= 5);
     for (const dispose of disposers) dispose();
     assert.equal(sections.length, 0);
     assert.equal(commands.length, 0);
     assert.equal(tools.length, 0);
 });
 
-test('controller: /align handler records the check, steers the check message, and reports status', async () => {
-    const { commands } = await mount({ mode: 'auto' });
-    const { agent, events, steered } = fakeAgent();
-    const definition = commands[0]!;
+test('controller: /align handler records the check in the store, steers the check message, and reports status', async () => {
+    const { commands, controller } = await mount({ mode: 'auto' });
+    const { session, events, push } = fakeSession();
+    const agent = { session, steer: () => { } };
+    const steered: unknown[] = [];
+    (agent as { steer: (m: unknown) => void }).steer = (message: unknown) => steered.push(message);
+    const definition = alignCommand(commands);
     const result = await definition.handler({
         agent: agent as never,
         rawInput: '',
@@ -142,10 +145,9 @@ test('controller: /align handler records the check, steers the check message, an
     assert.match(result.text ?? '', /Requirements Alignment/);
     assert.match(result.text ?? '', /Baseline revision: 0/);
     assert.match(result.text ?? '', /Current status:\nUnknown/);
-    // Durable manual-check event appended.
-    assert.equal(events.length, 1);
-    assert.equal(events[0]!.type, 'alignment/manual-check');
-    assert.equal(typeof (events[0]!.data as { at: number }).at, 'number');
+    // The manual check lands in the sidecar store, never in session events.
+    assert.equal(events.length, 0);
+    assert.equal(controller.stateStore.getStatus(session).manualChecks, 1);
     // Check steered to the agent for real analysis.
     assert.equal(steered.length, 1);
     const message = steered[0] as { content: Array<{ type: string; text: string }>; source: { kind: string; plugin: string; form: string } };
@@ -153,17 +155,33 @@ test('controller: /align handler records the check, steers the check message, an
     assert.equal(message.source.kind, 'plugin');
     assert.equal(message.source.plugin, 'requirements-alignment');
     assert.equal(message.source.form, 'notice');
+    void push;
 });
 
-test('controller: /align handler reports baseline revision and drift state after events', async () => {
-    const { commands } = await mount({ mode: 'auto' });
-    const { agent, events } = fakeAgent();
-    events.push({ seq: 0, type: 'alignment/baseline', data: { baseline: { revision: 2, goal: 'Optimize the result page', explicitConstraints: ['keep API'], updatedAt: 1 } } });
-    events.push({ seq: 1, type: 'alignment/drift', data: { reason: 'architecture-shift', description: 'cloud sync', at: 2 } });
-    events.push({ seq: 2, type: 'alignment/decision', data: { driftSeq: 1, decision: 'approve', at: 3 } });
-    events.push({ seq: 3, type: 'alignment/baseline-updated', data: { baseline: { revision: 3, goal: 'Optimize the result page', explicitConstraints: ['keep API', 'cloud sync'], updatedAt: 4 } } });
-    events.push({ seq: 4, type: 'alignment/manual-check', data: { at: 5 } });
-    const result = await commands[0]!.handler({ agent: agent as never, rawInput: '', signal: new AbortController().signal, commandId: 'x' as never });
+test('controller: /align handler reports baseline revision and drift state after store records', async () => {
+    const { commands, controller } = await mount({ mode: 'auto' });
+    const { session } = fakeSession();
+    await controller.stateStore.recordBaseline(session, {
+        revision: 2,
+        goal: 'Optimize the result page',
+        explicitConstraints: ['keep API'],
+        updatedAt: 1
+    });
+    const { driftSeq } = await controller.stateStore.recordDrift(session, {
+        reason: 'architecture-shift',
+        description: 'cloud sync',
+        at: 2
+    });
+    await controller.stateStore.recordDecision(session, { driftSeq, decision: 'approve', at: 3 });
+    await controller.stateStore.recordBaseline(session, {
+        revision: 3,
+        goal: 'Optimize the result page',
+        explicitConstraints: ['keep API', 'cloud sync'],
+        updatedAt: 4
+    });
+    await controller.stateStore.recordManualCheck(session, 5);
+    const agent = { session, steer: () => { } };
+    const result = await alignCommand(commands).handler({ agent: agent as never, rawInput: '', signal: new AbortController().signal, commandId: 'x' as never });
     assert.equal(result.kind, 'success');
     const text = result.text ?? '';
     assert.match(text, /Baseline revision: 3/);
@@ -177,12 +195,18 @@ test('controller: /align handler reports baseline revision and drift state after
 });
 
 test('controller: handler never throws on append failure and still steers', async () => {
-    const { commands } = await mount({ mode: 'auto' });
-    const broken = fakeAgent();
-    broken.agent.session.append = () => { throw new Error('log closed'); };
-    const result = await commands[0]!.handler({ agent: broken.agent as never, rawInput: '', signal: new AbortController().signal, commandId: 'y' as never });
+    const { commands, controller, ctx } = await mount({ mode: 'auto' });
+    // Sabotage the durable medium AFTER the store attached: the /align
+    // handler must log the failed manual-check record and still steer.
+    const storage = (ctx as unknown as { storageDomain: ReturnType<typeof fakeStorageDomain> }).storageDomain;
+    await storage.__close();
+    const { session } = fakeSession();
+    const steered: unknown[] = [];
+    const agent = { session, steer: (message: unknown) => steered.push(message) };
+    const result = await alignCommand(commands).handler({ agent: agent as never, rawInput: '', signal: new AbortController().signal, commandId: 'y' as never });
     assert.equal(result.kind, 'success');
-    assert.equal(broken.steered.length, 1);
+    assert.equal(steered.length, 1);
+    assert.equal(controller.stateStore.getStatus(session).manualChecks, 0, 'failed record must not commit memory state');
 });
 
 test('statusText: covers revision 0 and recorded states', () => {
@@ -241,10 +265,9 @@ test('controller: public registration contract — Auto / Manual / Off', async (
         }
         assert.equal(commands.length > 0, row.align, `${row.mode}: /align`);
         if (row.align) {
-            assert.equal(commands[0]!.name, 'align');
-            const { agent } = fakeAgent();
-            const result = await commands[0]!.handler({
-                agent: agent as never,
+            const { session } = fakeSession();
+            const result = await alignCommand(commands).handler({
+                agent: { session, steer: () => { } } as never,
                 rawInput: '',
                 signal: new AbortController().signal,
                 commandId: `contract-${row.mode}` as never
@@ -262,12 +285,26 @@ test('controller: public registration contract — Auto / Manual / Off', async (
 });
 
 test('controller: /align reports baseline-update-pending after approve without a new baseline', async () => {
-    const { commands } = await mount({ mode: 'auto' });
-    const { agent, events } = fakeAgent();
-    events.push({ seq: 0, type: 'alignment/baseline', data: { baseline: { revision: 1, goal: 'Local-only app', explicitConstraints: ['no cloud'], updatedAt: 1 } } });
-    events.push({ seq: 1, type: 'alignment/drift', data: { reason: 'architecture-shift', description: 'add cloud sync', at: 2 } });
-    events.push({ seq: 2, type: 'alignment/decision', data: { driftSeq: 1, decision: 'approve', at: 3 } });
-    const result = await commands[0]!.handler({ agent: agent as never, rawInput: '', signal: new AbortController().signal, commandId: 'z' as never });
+    const { commands, controller } = await mount({ mode: 'auto' });
+    const { session } = fakeSession();
+    await controller.stateStore.recordBaseline(session, {
+        revision: 1,
+        goal: 'Local-only app',
+        explicitConstraints: ['no cloud'],
+        updatedAt: 1
+    });
+    const { driftSeq } = await controller.stateStore.recordDrift(session, {
+        reason: 'architecture-shift',
+        description: 'add cloud sync',
+        at: 2
+    });
+    await controller.stateStore.recordDecision(session, { driftSeq, decision: 'approve', at: 3 });
+    const result = await alignCommand(commands).handler({
+        agent: { session, steer: () => { } } as never,
+        rawInput: '',
+        signal: new AbortController().signal,
+        commandId: 'z' as never
+    });
     assert.equal(result.kind, 'success');
     const text = result.text ?? '';
     assert.match(text, /Baseline revision: 1/);

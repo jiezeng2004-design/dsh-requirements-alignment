@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import { UserQuestionError } from '@deepseek-ai/dsh-user-questions';
-import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
 import {
     buildBaseline,
     buildDriftQuestion,
@@ -17,20 +16,7 @@ import {
     withDefaultOptions
 } from '../src/baseline-tool.ts';
 import { foldAlignmentStatus } from '../src/status.ts';
-
-/** A session double with a real event log and append returning logged events. */
-function makeSession() {
-    const events: SessionEvent[] = [];
-    const session = {
-        events: events as never,
-        append: ((type: string, data: unknown) => {
-            const appended = { seq: events.length, time: 0, type, data } as unknown as SessionEvent;
-            events.push(appended);
-            return appended;
-        }) as never
-    };
-    return { session, events };
-}
+import { fakeSession, makeStore, legacyEvent } from './helpers.ts';
 
 interface FakeAsk {
     answer?: unknown;
@@ -58,13 +44,14 @@ function makeCtx(fakeAsk: FakeAsk, noQuestions = false) {
     return { ctx: ctx as never, definitions };
 }
 
-function execFor(session: ReturnType<typeof makeSession>['session']) {
+function execFor(session: ReturnType<typeof fakeSession>['session']) {
     const agent = { session };
     return { exec: { agent, signal: new AbortController().signal } as never };
 }
 
 const approveAnswer = { answers: [{ id: 'alignment-drift', selected: [DEFAULT_DRIFT_OPTIONS[0].label] }] };
 const emptyAnswer = { answers: [{ id: 'alignment-drift', selected: [] }] };
+
 test('baseline-tool: validateBaselineInput accepts a minimal baseline', () => {
     assert.deepEqual(validateBaselineInput({ goal: 'Fix the form bug', explicitConstraints: ['no UI change'] }), {
         goal: 'Fix the form bug',
@@ -89,51 +76,56 @@ test('baseline-tool: buildBaseline advances the revision', () => {
     assert.equal(second.goal, 'v2');
 });
 
-test('baseline-tool: establish_baseline records silently without asking the user', async () => {
+test('baseline-tool: establish_baseline records silently in the store without asking the user', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({});
-    registerEstablishBaseline(ctx);
+    registerEstablishBaseline(ctx, store);
     assert.equal(definitions.length, 1);
-    const { session, events } = makeSession();
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     const result = await definitions[0]!.execute({ baseline: { goal: 'Fix typo', explicitConstraints: ['no UI change'] } }, exec);
     assert.deepEqual(result, { revision: 1 });
-    assert.equal(events.length, 1);
-    assert.equal(events[0]!.type, 'alignment/baseline');
-    const status = foldAlignmentStatus(events);
+    // The baseline lives in the sidecar store, never in session events.
+    assert.equal(session.events.length, 0);
+    const status = store.getStatus(session);
     assert.equal(status.revision, 1);
     assert.equal(status.baseline?.goal, 'Fix typo');
+    assert.equal(status.status, 'aligned');
     // A second call updates the revision instead of re-recording.
     await definitions[0]!.execute({ baseline: { goal: 'Fix typo', explicitConstraints: ['no UI change', 'no API change'] } }, exec);
-    assert.equal(events.length, 2);
-    assert.equal(events[1]!.type, 'alignment/baseline-updated');
-    assert.equal(foldAlignmentStatus(events).revision, 2);
+    assert.equal(store.getStatus(session).revision, 2);
+    assert.equal(session.events.length, 0, 'no alignment session events may ever be appended');
 });
 
 test('baseline-tool: establish_baseline validates its input', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({});
-    registerEstablishBaseline(ctx);
-    const { session } = makeSession();
+    registerEstablishBaseline(ctx, store);
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     await assert.rejects(
         definitions[0]!.execute({ baseline: {} }, exec),
         /must include a goal or at least one/
     );
+    assert.equal(store.getStatus(session).revision, 0, 'nothing recorded for invalid input');
 });
 
 test('baseline-tool: establish_baseline requires a calling agent', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({});
-    registerEstablishBaseline(ctx);
+    registerEstablishBaseline(ctx, store);
     await assert.rejects(
         definitions[0]!.execute({ baseline: { goal: 'x' } }, { agent: undefined, signal: new AbortController().signal } as never),
         /requires a calling agent/
     );
 });
 
-test('baseline-tool: report_drift asks the user and records drift + decision', async () => {
+test('baseline-tool: report_drift asks the user and records drift + decision in the store', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({ answer: approveAnswer });
-    registerReportDrift(ctx);
+    registerReportDrift(ctx, store);
     assert.equal(definitions.length, 1);
-    const { session, events } = makeSession();
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     const result = await definitions[0]!.execute({
         reason: 'architecture-shift',
@@ -141,17 +133,20 @@ test('baseline-tool: report_drift asks the user and records drift + decision', a
         requiredChange: 'baseline becomes cross-device'
     }, exec);
     assert.deepEqual(result, { decision: 'approve', requiredChange: 'baseline becomes cross-device' });
-    assert.equal(events.length, 2);
-    assert.equal(events[0]!.type, 'alignment/drift');
-    assert.equal((events[0]!.data as { reason: string }).reason, 'architecture-shift');
-    assert.equal(events[1]!.type, 'alignment/decision');
-    assert.equal((events[1]!.data as { decision: string }).decision, 'approve');
-    assert.equal((events[1]!.data as { driftSeq: number }).driftSeq, 0);
+    const status = store.getStatus(session);
+    assert.equal(status.driftCount, 1);
+    assert.equal(status.lastDrift?.reason, 'architecture-shift');
+    assert.equal(status.lastDecision?.decision, 'approve');
+    // The decision pairs the drift by the store's drift seq (the public
+    // AlignmentStatus.lastDrift deliberately carries no driftSeq, like the
+    // legacy fold).
+    assert.equal(status.lastDecision?.driftSeq, 0);
     // Approve without a recorded new baseline is the durability state, not aligned.
-    assert.equal(foldAlignmentStatus(events).status, 'baseline-update-pending');
+    assert.equal(status.status, 'baseline-update-pending');
+    assert.equal(session.events.length, 0, 'no alignment session events may ever be appended');
 });
 
-test('baseline-tool: report_drift maps default approve, default reject, and free text', async () => {
+test('baseline-tool: mapDriftAnswer maps default approve, default reject, and free text', () => {
     assert.equal(mapDriftAnswer([DEFAULT_DRIFT_OPTIONS[0].label], undefined).decision, 'approve');
     assert.equal(mapDriftAnswer([DEFAULT_DRIFT_OPTIONS[1].label], undefined).decision, 'reject');
     const revised = mapDriftAnswer([], 'Use file export instead.');
@@ -206,39 +201,43 @@ test('baseline-tool: uninterpretable answers fail loud instead of silently rejec
 });
 
 test('baseline-tool: an empty answer fails the report_drift tool and records no decision', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({ answer: emptyAnswer });
-    registerReportDrift(ctx);
-    const { session, events } = makeSession();
+    registerReportDrift(ctx, store);
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     await assert.rejects(
         definitions[0]!.execute({ reason: 'behavior-change', description: 'x' }, exec),
         /without a selection/
     );
     // The drift candidate stays durable; no decision is fabricated.
-    assert.equal(events.length, 1);
-    assert.equal(events[0]!.type, 'alignment/drift');
-    assert.equal(foldAlignmentStatus(events).status, 'drift-pending');
+    const status = store.getStatus(session);
+    assert.equal(status.driftCount, 1);
+    assert.equal(status.status, 'drift-pending');
+    assert.equal(session.events.length, 0);
 });
 
 test('baseline-tool: report_drift records a revise decision with the custom note and returns it', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({ answer: { answers: [{ id: 'alignment-drift', selected: [], custom: 'Sync via export files instead.' }] } });
-    registerReportDrift(ctx);
-    const { session, events } = makeSession();
+    registerReportDrift(ctx, store);
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     const result = await definitions[0]!.execute({ reason: 'user-direction-change', description: 'sync' }, exec);
     // The tool result feeds the user's exact choice back to the agent, so it
     // never has to re-ask which direction was picked.
     assert.deepEqual(result, { decision: 'revise', note: 'Sync via export files instead.' });
-    assert.equal(events.length, 2);
-    const decisionData = events[1]!.data as { decision: string; note: string };
-    assert.equal(decisionData.decision, 'revise');
-    assert.equal(decisionData.note, 'Sync via export files instead.');
+    const status = store.getStatus(session);
+    assert.equal(status.lastDecision?.decision, 'revise');
+    assert.equal(status.lastDecision?.note, 'Sync via export files instead.');
+    assert.equal(session.events.length, 0);
 });
 
 test('baseline-tool: report_drift returns the selected custom option label as the note', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({ answer: { answers: [{ id: 'alignment-drift', selected: ['Use export files'] }] } });
-    registerReportDrift(ctx);
-    const { session, events } = makeSession();
+    registerReportDrift(ctx, store);
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     const result = await definitions[0]!.execute({
         reason: 'user-direction-change',
@@ -247,51 +246,55 @@ test('baseline-tool: report_drift returns the selected custom option label as th
         options: [{ label: 'Use export files' }, { label: 'Add cloud sync' }]
     }, exec);
     assert.deepEqual(result, { decision: 'revise', note: 'Use export files', requiredChange: 'baseline becomes cross-device' });
-    assert.equal(events.length, 2);
-    assert.equal((events[1]!.data as { note: string }).note, 'Use export files');
+    assert.equal(store.getStatus(session).lastDecision?.note, 'Use export files');
 });
 
 test('baseline-tool: report_drift records the drift even when the question fails (child escalation)', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({ error: new UserQuestionError('children cannot ask', 'DELEGATED_CALLER') });
-    registerReportDrift(ctx);
-    const { session, events } = makeSession();
+    registerReportDrift(ctx, store);
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     await assert.rejects(
         definitions[0]!.execute({ reason: 'constraint-conflict', description: 'api must change' }, exec),
         /child agent.*Requirement drift candidate/s
     );
     // The drift candidate is durable; no decision was recorded.
-    assert.equal(events.length, 1);
-    assert.equal(events[0]!.type, 'alignment/drift');
-    assert.equal(foldAlignmentStatus(events).status, 'drift-pending');
+    const status = store.getStatus(session);
+    assert.equal(status.driftCount, 1);
+    assert.equal(status.lastDecision, undefined);
+    assert.equal(status.status, 'drift-pending');
 });
 
 test('baseline-tool: report_drift handles cancelled questions and missing channels', async () => {
+    const store1 = await makeStore();
     const cancelled = makeCtx({ error: new UserQuestionError('dismissed', 'ASK_CANCELLED') });
-    registerReportDrift(cancelled.ctx);
-    const { session } = makeSession();
+    registerReportDrift(cancelled.ctx, store1);
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     await assert.rejects(
         cancelled.definitions[0]!.execute({ reason: 'scope-expansion', description: 'x' }, exec),
         /wait for their message/
     );
     // A missing channel is a prerequisite, validated BEFORE the durable write:
-    // the tool fails with a clean log.
+    // the tool fails with no durable residue at all.
+    const store2 = await makeStore();
     const noChannel = makeCtx({}, true);
-    registerReportDrift(noChannel.ctx);
-    const { session: session2, events: events2 } = makeSession();
+    registerReportDrift(noChannel.ctx, store2);
+    const { session: session2 } = fakeSession();
     const { exec: exec2 } = execFor(session2);
     await assert.rejects(
         noChannel.definitions[0]!.execute({ reason: 'scope-expansion', description: 'x' }, exec2),
         /no user-questions channel/
     );
-    assert.equal(events2.length, 0);
+    assert.equal(store2.getStatus(session2).driftCount, 0, 'no drift recorded without a question channel');
 });
 
 test('baseline-tool: invalid report_drift arguments fail before any durable write', async () => {
+    const store = await makeStore();
     const { ctx, definitions } = makeCtx({ answer: approveAnswer });
-    registerReportDrift(ctx);
-    const { session, events } = makeSession();
+    registerReportDrift(ctx, store);
+    const { session } = fakeSession();
     const { exec } = execFor(session);
     const invalid = [
         { reason: 'not-a-reason', description: 'x' },
@@ -305,14 +308,14 @@ test('baseline-tool: invalid report_drift arguments fail before any durable writ
     for (const args of invalid) {
         // Schema-level violations surface as ToolArgsError before execute;
         // plugin-level violations carry the report_drift: prefix. Either way
-        // the tool fails and the session log stays clean.
+        // the tool fails and the store stays clean.
         await assert.rejects(
             definitions[0]!.execute(args as never, exec),
             /report_drift:|invalid arguments/
         );
-        assert.equal(events.length, 0, `args ${JSON.stringify(args)} must not append any event`);
+        assert.equal(store.getStatus(session).driftCount, 0, `args ${JSON.stringify(args)} must not record anything`);
     }
-    assert.equal(foldAlignmentStatus(events).driftCount, 0);
+    assert.equal(store.getStatus(session).driftCount, 0);
 });
 
 test('baseline-tool: report_drift validates its arguments', () => {
@@ -357,4 +360,20 @@ test('baseline-tool: renderDriftOutcome instructs the follow-up and names the us
     assert.match(renderDriftOutcome('approve', undefined, 'baseline becomes cross-device'), /Required baseline change: baseline becomes cross-device/);
     assert.match(renderDriftOutcome('revise', 'Use export files', 'baseline becomes cross-device'), /"Use export files"/);
     assert.match(renderDriftOutcome('revise', 'Use export files', 'baseline becomes cross-device'), /Required baseline change: baseline becomes cross-device/);
+});
+
+// --- store parity: a store-driven session must match the legacy fold -------
+test('baseline-tool: store state after drift/decision equals the legacy fold of equivalent events', async () => {
+    const store = await makeStore();
+    const { session } = fakeSession();
+    await store.recordDrift(session, { reason: 'scope-expansion', description: 'refactor state management', at: 10 });
+    const decisionStatus = store.getStatus(session);
+    assert.equal(decisionStatus.driftCount, 1);
+    // Equivalent legacy events fold to the same posture.
+    const legacy = foldAlignmentStatus([
+        legacyEvent('alignment/drift', { reason: 'scope-expansion', description: 'refactor state management', at: 10 }, 0)
+    ]);
+    assert.equal(legacy.status, decisionStatus.status);
+    assert.equal(legacy.driftCount, decisionStatus.driftCount);
+    assert.equal(session.events.length, 0);
 });

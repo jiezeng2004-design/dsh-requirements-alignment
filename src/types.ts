@@ -1,16 +1,21 @@
 /**
  * Pure types of the requirements-alignment domain: the requirement baseline,
- * the drift taxonomy, the durable session events this plugin appends, and the
- * folded alignment status view. Free of host-side value imports, so host
- * consumers and tests share it.
+ * the drift taxonomy, the legacy session events this plugin USED to append
+ * (kept for persisted-session read compatibility), and the folded alignment
+ * status view. Free of host-side value imports, so host consumers and tests
+ * share it.
  *
  * Design rules (matching DSH session-event conventions):
- * - Every alignment event is log-only (never model surface, no surfaceOp),
- *   so resume, fork, and compaction preserve it and pure folds reconstruct
- *   the same state without a live mirror.
- * - Baseline events are whole-value snapshots: the payload carries the
+ * - Since the persistence-compatibility fix, canonical alignment state lives
+ *   in the AlignmentStateStore sidecar (`src/alignment-state-store.ts`), NOT
+ *   in session events. The `alignment/*` event types below exist only so
+ *   legacy v0.1/v0.2 logs fold and migrate; production code never appends
+ *   them (the DSH persistence reader's generated known-event vocabulary does
+ *   not contain them, and an appended event would make the session unreadable
+ *   to every DSH build).
+ * - Baseline events were whole-value snapshots: the payload carried the
  *   complete post-change baseline (revision included), never a delta. The
- *   last baseline event wins.
+ *   last baseline event won. The sidecar checkpoints keep the same rule.
  * - `tool/call` records — including `ask_user_question` — are NOT alignment
  *   state: other plugins, plan mode, and ordinary agent questions must never
  *   pollute the alignment fold.
@@ -18,6 +23,16 @@
  * @module dsh-requirements-alignment/types
  */
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
+
+/**
+ * Runtime alignment operation mode: `auto` contributes the policy section,
+ * tools, and `/align`; `manual` keeps tools and `/align` only; `off`
+ * registers nothing.
+ */
+export type AlignmentMode = 'auto' | 'manual' | 'off';
+
+/** Legal mode names, used by the configuration schema and validation. */
+export const ALIGNMENT_MODES = ['auto', 'manual', 'off'] as const;
 
 /**
  * Finite drift taxonomy. A drift candidate is a direction-level change, not a
@@ -114,29 +129,58 @@ export interface LegacyStatusEvent {
 
 declare module '@deepseek-ai/dsh-session/types' {
     interface SessionEventMap {
+        // ─────────────────────────────────────────────────────────────────────
+        // LEGACY PERSISTED-SESSION READ COMPATIBILITY ONLY.
+        //
+        // These declarations exist so old session logs (v0.1/v0.2) fold
+        // correctly through the legacy compatibility layer
+        // (`foldAlignmentStatus` / `foldLegacyTimeline`) and so the migration
+        // tooling can recognize the legacy vocabulary.
+        //
+        // They are NOT a runtime registration: DSH's persistence reader
+        // builds its known-event vocabulary from the generated
+        // `KNOWN_SESSION_EVENT_TYPES` set, which does NOT contain these
+        // types. Appending one of these events to a live session makes the
+        // log unreadable to every DSH build (SessionFormatUnsupportedError).
+        // Production code MUST NOT append alignment/* events anymore —
+        // canonical alignment state lives in the AlignmentStateStore
+        // sidecar. `SessionEventMap` augmentation = TypeScript-only; it is
+        // NEVER runtime registration.
+        // ─────────────────────────────────────────────────────────────────────
         /**
          * The initial requirement baseline was recorded (revision >= 1). The
          * last baseline event wins; log-only, never model surface.
+         *
+         * @deprecated legacy persisted-session read compatibility only — the
+         *   store records baselines through AlignmentStateStore, never here.
          */
         'alignment/baseline': BaselineEvent;
         /**
          * The baseline was revised after a user decision: whole-value replace,
          * revision increments. Log-only, never model surface.
+         *
+         * @deprecated legacy persisted-session read compatibility only.
          */
         'alignment/baseline-updated': BaselineEvent;
         /**
          * A drift candidate was detected. Appended before any user interaction,
          * so the candidate is durable even when the question fails or is
          * cancelled. Log-only, never model surface.
+         *
+         * @deprecated legacy persisted-session read compatibility only.
          */
         'alignment/drift': DriftEvent;
         /**
          * The user's decision on one drift candidate, paired with the drift
          * event by its seq. Log-only, never model surface.
+         *
+         * @deprecated legacy persisted-session read compatibility only.
          */
         'alignment/decision': DecisionEvent;
         /**
          * A manual `/align` inspection ran. Log-only, never model surface.
+         *
+         * @deprecated legacy persisted-session read compatibility only.
          */
         'alignment/manual-check': ManualCheckEvent;
         /**
@@ -146,6 +190,25 @@ declare module '@deepseek-ai/dsh-session/types' {
          */
         'alignment/status': LegacyStatusEvent;
     }
+}
+
+/**
+ * The exact legacy alignment event vocabulary this plugin owns — the ONLY
+ * types the migration tooling may ever touch. Everything else in a session
+ * log is foreign and must remain byte-identical.
+ */
+export const LEGACY_ALIGNMENT_EVENT_TYPES: ReadonlySet<string> = new Set([
+    'alignment/status',
+    'alignment/baseline',
+    'alignment/baseline-updated',
+    'alignment/drift',
+    'alignment/decision',
+    'alignment/manual-check'
+]);
+
+/** Whether an event type belongs to the legacy alignment vocabulary. */
+export function isLegacyAlignmentEventType(type: string): boolean {
+    return LEGACY_ALIGNMENT_EVENT_TYPES.has(type);
 }
 
 /**

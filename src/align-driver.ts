@@ -6,6 +6,14 @@
  * `scripts/dogfood.ps1`), because the headless runner has no command adapter
  * of its own. The product plugin never mounts it.
  *
+ * Snapshots read the canonical AlignmentStateStore view (via the
+ * `requirementsAlignment` service) — the durable sidecar, not session events,
+ * since the fixed plugin no longer writes `alignment/*` events. The store is
+ * resolved lazily at every snapshot (never captured at `apply()` time), so
+ * the driver picks up the controller's sidecar even when `apply()` runs
+ * before the controller mounts. When the controller is absent (very old
+ * profile), the legacy fold is the fallback.
+ *
  * @module dsh-requirements-alignment/align-driver
  */
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -14,6 +22,8 @@ import { CallId } from '@deepseek-ai/dsh-llm';
 import { assembleContextFor } from '@deepseek-ai/dsh-agent';
 import { POLICY_SECTION } from './policy.ts';
 import { foldAlignmentStatus } from './status.ts';
+import type { AlignmentStateStore } from './alignment-state-store.ts';
+import type { AlignmentStatus } from './types.ts';
 
 /** Raw driver config. */
 export interface AlignDriverConfig {
@@ -102,8 +112,7 @@ function record(recordPath: string | undefined, line: unknown): void {
 }
 
 /** One folded status snapshot, JSON-safe for the record file. */
-function snapshot(agent: import('@deepseek-ai/dsh-agent').Agent, phase: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
-    const status = foldAlignmentStatus(agent.session.events);
+function snapshot(status: AlignmentStatus, agent: import('@deepseek-ai/dsh-agent').Agent, phase: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
     return {
         phase,
         sessionId: String(agent.session.id),
@@ -130,8 +139,28 @@ function snapshot(agent: import('@deepseek-ai/dsh-agent').Agent, phase: string, 
     };
 }
 
-/** Tool names that never mutate the workspace (first-mutation snapshot). */
-const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'web_search', 'skill', 'ask_user_question', 'establish_baseline', 'report_drift']);
+/** The canonical store when the controller is mounted, else undefined. */
+function resolveStore(ctx: import('@deepseek-ai/cordis').Context): AlignmentStateStore | undefined {
+    const service = ctx.get('requirementsAlignment');
+    return service?.stateStore;
+}
+
+/** The store view of one agent's alignment status (legacy fold fallback). */
+function statusOf(store: AlignmentStateStore | undefined, agent: import('@deepseek-ai/dsh-agent').Agent): AlignmentStatus {
+    return store !== undefined ? store.getStatus(agent.session) : foldAlignmentStatus(agent.session.events);
+}
+
+/**
+ * Tool names that never mutate the workspace (first-mutation snapshot).
+ * Includes the planning/self-state tools (`todo_write`, `skill`) beside the
+ * read-only and alignment tools: the first-mutation check exists to prove the
+ * baseline was established before any WORKSPACE mutation — a todo-list update
+ * or a policy-note read is not one — so counting such calls as the first
+ * mutation would misreport a policy-compliant run. Anything not listed here
+ * (edit/write/pwsh/... and every future workspace-mutating tool) is still
+ * treated as a mutation by default.
+ */
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'web_search', 'skill', 'ask_user_question', 'establish_baseline', 'report_drift', 'todo_write']);
 
 /**
  * Mount the driver: at every `agent/session-start`, record an initial
@@ -144,8 +173,17 @@ const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'web_search', 'skill', 
  */
 export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignDriverConfig = {}): void {
     const resolved = resolveAlignDriverConfig(config);
+    // LAZY store resolution: never capture the store at apply() time. The
+    // controller (and its sidecar service) may mount AFTER the driver —
+    // capturing `const store = resolveStore(ctx)` here permanently pinned
+    // `undefined` and made every later status read fall back to the legacy
+    // session-log fold (revision 0) even once the sidecar was available.
+    // Re-resolving on every read picks the current store up as soon as it
+    // exists, while `statusOf` keeps the legacy fold as the fallback when no
+    // store ever appears.
+    const getStore = () => resolveStore(ctx);
     ctx.on('agent/session-start', async ({ agent }) => {
-        record(resolved.recordPath, snapshot(agent, 'start'));
+        record(resolved.recordPath, snapshot(statusOf(getStore(), agent), agent, 'start'));
         if (resolved.injectAskUserCall === true) {
             try {
                 agent.session.append('tool/call', {
@@ -178,7 +216,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                         resultKind: execution?.result.kind,
                         resultText: execution?.result.text,
                         alignCommandRuns: agent.session.events.filter((event) => event.type === 'command/run' && event.data.name === 'align').length,
-                        manualCheckEvents: agent.session.events.filter((event) => event.type === 'alignment/manual-check').length
+                        manualChecks: statusOf(getStore(), agent).manualChecks
                     });
                 } catch (error) {
                     record(resolved.recordPath, { phase: 'align', executed: false, error: String(error) });
@@ -231,23 +269,31 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
         }
     });
     let firstMutationRecorded = false;
+    let lastDecisionAt: number | undefined;
     ctx.on('session/event', (session, event) => {
         const agents = ctx.get('agents');
         const agent = agents?.get(session.id);
         if (agent === undefined) return;
         if (event.type === 'turn/end') {
-            record(resolved.recordPath, snapshot(agent, 'turn-end'));
+            record(resolved.recordPath, snapshot(statusOf(getStore(), agent), agent, 'turn-end'));
         }
         if (resolved.snapshotFirstMutation === true && !firstMutationRecorded && event.type === 'tool/call'
             && typeof event.data.name === 'string' && !READ_ONLY_TOOLS.has(event.data.name)) {
             firstMutationRecorded = true;
-            record(resolved.recordPath, snapshot(agent, 'first-mutation', { toolName: event.data.name }));
+            record(resolved.recordPath, snapshot(statusOf(getStore(), agent), agent, 'first-mutation', { toolName: event.data.name }));
         }
-        if (resolved.haltAtDecision === true && event.type === 'alignment/decision') {
-            record(resolved.recordPath, snapshot(agent, 'halted-after-decision'));
-            // Let the JSONL persistence batch (<= 200 ms) flush before exit so
-            // the durable log contains the decision event.
-            setTimeout(() => process.exit(0), 1500);
+        // The decision lives in the sidecar now (no alignment/decision session
+        // event): halt as soon as a NEW decision becomes visible in the
+        // canonical store view.
+        if (resolved.haltAtDecision === true) {
+            const status = statusOf(getStore(), agent);
+            if (status.lastDecision !== undefined && status.lastDecision.at !== lastDecisionAt) {
+                lastDecisionAt = status.lastDecision.at;
+                record(resolved.recordPath, snapshot(status, agent, 'halted-after-decision'));
+                // Let the persistence batch (<= 200 ms) flush before exit so
+                // the durable sidecar contains the decision checkpoint.
+                setTimeout(() => process.exit(0), 1500);
+            }
         }
     });
 }

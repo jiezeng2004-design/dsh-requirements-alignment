@@ -1,10 +1,16 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Real DSH dogfooding for dsh-requirements-alignment v0.2: boots the
-    align-headless profile (dsh-base + dsh-headless + this plugin + scripted
-    answer provider + align driver) through the real 'dsh' launcher and runs
-    the behavioral scenarios. Uses an isolated DSH_HOME under the workspace.
+    Real DSH dogfooding for dsh-requirements-alignment v0.2.2: boots the
+    align-headless profile (dsh-base + dsh-headless + this plugin + storage
+    stack + scripted answer provider + align driver) through the real 'dsh'
+    launcher and runs the behavioral scenarios. Uses an isolated DSH_HOME
+    under the workspace.
+
+    The align-headless profile mounts @deepseek-ai/dsh-storage(-json/-domain)
+    (see .dsh-dogfood/profiles/align-headless/cordis.patch.yml): the fixed
+    plugin's canonical alignment state lives in the storage-domain sidecar,
+    so headless runs need the same official durable seam as the web profile.
 
     HOST PREREQUISITE (project memory): this script must run under
     danger-full-access. Under workspace-write the DSH file sandbox denies

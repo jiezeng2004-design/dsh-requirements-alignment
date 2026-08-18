@@ -6,7 +6,9 @@ Keep long-running agents aligned with user intent while they work.
 
 ## Overview
 
-`dsh-requirements-alignment` turns the user's request into a durable **requirement baseline** — goal, protected constraints, must-preserve behavior, allowed scope, and settled user decisions — and guards it while the agent executes. The agent works silently until a step would materially change the task direction; only then does the plugin surface a **drift candidate** to you, records your decision, and updates the baseline. Everything is folded from log-only session events, so resume, fork, and compaction recover the same state.
+`dsh-requirements-alignment` turns the user's request into a durable **requirement baseline** — goal, protected constraints, must-preserve behavior, allowed scope, and settled user decisions — and guards it while the agent executes. The agent works silently until a step would materially change the task direction; only then does the plugin surface a **drift candidate** to you, records your decision, and updates the baseline.
+
+Canonical alignment state lives in the durable `AlignmentStateStore` sidecar — an official `storage-domain` domain over the `storage-json` backend — never in session events. The DSH Session log holds only official DSH-recognizable events, so a bare DSH build (without this plugin) reads any new session, and resume, fork, and compaction recover the same state. The `alignment/*` event vocabulary is kept solely for legacy compatibility, migration, and test/fold fallbacks; production never appends it.
 
 **You decide the direction. The agent decides the engineering.**
 
@@ -30,7 +32,7 @@ Plan Mode is the official review-approve step *before* implementation. Requireme
 | `establish_baseline` tool | Records the baseline (goal, `explicitConstraints`, `mustPreserve`, `allowedScope`, `userDecisions`, `openDirectionDecisions`). Silent — it never asks the user. Recording again bumps the baseline revision. |
 | `report_drift` tool | Records a drift candidate (`reason`, `description`, `requiredChange`), asks you one question through the native user-questions channel, and records your decision. The default approve / stay-within-scope options are always offered; the two defaults map to `approve` / `reject`, a model-supplied alternative direction you pick — or your own free-text answer — maps to `revise` with your exact words as the note, never to a silent rejection. The tool result returns your exact choice (the `note`) and the required baseline change to the agent, so it never re-asks what you picked. Only this plugin's events feed the alignment state — unrelated `ask_user_question` calls (plan mode, other plugins) never pollute it. |
 | `/align` command | Manual entry: reports the folded status (baseline revision, goal, protected constraints, drift count, last drift, last decision, current status) and steers a fresh alignment inspection into the agent. It inspects; it never blocks execution. |
-| Durable session state | Dedicated `alignment/*` events plus pure fold functions give per-session alignment state that survives resume, fork, and compaction — read straight from the session log, no live mirror. |
+| Durable state | Canonical alignment state is written to the durable `AlignmentStateStore` sidecar (official `storage-domain` → `storage-json` backend), keyed by session lifecycle identity, so it survives resume, fork, and compaction — and a bare DSH build without this plugin still reads new sessions. The session log itself only ever receives official DSH events; `alignment/*` remains a legacy/migration/fold fallback only. |
 
 ## Installation
 
@@ -83,7 +85,7 @@ After you change `mode` in the profile bundle, restart the current DSH Web profi
 
 ### Off ≠ Uninstall
 
-`mode: off` leaves the bundle in the profile. The row is still loaded, session history keeps any `alignment/*` events it already appended, and you can switch back to Auto or Manual by changing `mode`. That is not the same as uninstalling.
+`mode: off` leaves the bundle in the profile. The row is still loaded, no alignment tools or policy are registered, and you can switch back to Auto or Manual by changing `mode`. That is not the same as uninstalling. (A session that predates the persistence-compatibility fix may still carry legacy `alignment/*` events in its log; current production never appends them.)
 
 ```yaml
 # disable the controller only (leaves the ask-user tool mounted)
@@ -97,7 +99,7 @@ After you change `mode` in the profile bundle, restart the current DSH Web profi
 dsh plugin --profile web rm dsh-requirements-alignment
 ```
 
-Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the `/align` command, and both tools. Session history keeps the `alignment/*` events it appended (like every other plugin event, e.g. `plan/mode`).
+Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the `/align` command, and both tools. Canonical alignment state remains in the durable sidecar. Only sessions written by older versions keep legacy `alignment/*` events in their log — the current plugin never appends them to live sessions.
 
 ## Auto mode (default)
 
@@ -239,6 +241,16 @@ The v0.2.1 release gate verified:
 - Packed add/rm smoke: **34/34** — Auto → Manual → Off against the current v0.2.1 tarball
 - v0.2.0 dogfood baseline (unchanged protocol): **63/63 checks passing** (11 scenarios); natural drift trigger **3/4**
 
+The v0.2.2 persistence-compatibility gate verified:
+
+- Core modifications: **0**
+- Node tests: **133/133 passing** (2 `statusCache` session-identity + 3 align-driver lazy-resolution regressions)
+- Targeted store / persistence / migration regression suites: **29/29 passing**
+- Align-driver regression: `apply()` before the controller exists → later reads resolve the sidecar (revision 1), never the legacy fold
+- Real dogfood 01-greenfield / 02-typo / 03-bugfix: **PASS** (03 asserts `baseline recorded` + `revision >= 1`)
+- `npm pack --dry-run` passes (exports targets all present; no v0.3.0 runtime-mode / hot-switch files)
+- DSH rc.6: `KNOWN_SESSION_EVENT_TYPES` = **44**, `alignment/*` = **0** official known event types
+
 Detailed evidence and the bounded-run caveat are recorded in `ACCEPTANCE.md`.
 
 ## Development
@@ -248,7 +260,7 @@ pnpm install          # dependencies
 pnpm run typecheck    # tsc (src + test)
 pnpm run lint         # eslint (src + test)
 pnpm run build        # tsc → lib/
-pnpm test             # node:test (91 tests)
+pnpm test             # node:test (133 tests)
 pnpm run check        # all of the above
 ```
 
