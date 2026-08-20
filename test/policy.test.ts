@@ -109,7 +109,8 @@ test('policy: custom section replaces the default and keeps the summary', () => 
 
 test('policy: manual check message inspects alignment and never claims a gate', () => {
     assert.match(MANUAL_CHECK_MESSAGE, /Requirements Alignment check \(manual\)/);
-    assert.match(MANUAL_CHECK_MESSAGE, /Fold the current requirement baseline/);
+    assert.match(MANUAL_CHECK_MESSAGE, /durable sidecar state/);
+    assert.doesNotMatch(MANUAL_CHECK_MESSAGE, /from the session log/);
     assert.match(MANUAL_CHECK_MESSAGE, /report_drift/);
     assert.match(MANUAL_CHECK_MESSAGE, /never blocks execution/);
     assert.match(MANUAL_CHECK_MESSAGE, /never replaces plan mode/);

@@ -68,9 +68,9 @@ If you are a child agent, you cannot ask the user. If continuing requires changi
 
 /**
  * Render the durable baseline summary shown to the model at every assembly.
- * Folded from the session log, so resume, fork, and compaction feed the same
- * state back. Renders present fields only; an open drift is called out so a
- * resumed session can finish the interrupted protocol.
+ * Taken from the durable sidecar status, so resume, fork, and compaction feed
+ * the same state back. Renders present fields only; an open drift is called
+ * out so a resumed session can finish the interrupted protocol.
  *
  * @param status The session's folded alignment status.
  * @returns The summary block, or '' when nothing direction-relevant is recorded.
@@ -130,7 +130,7 @@ export function baselineSummary(status: AlignmentStatus): string {
  * as one user message, complete enough to drive the check on its own. It
  * inspects alignment; it never blocks execution and never replaces plan mode.
  */
-export const MANUAL_CHECK_MESSAGE = `Requirements Alignment check (manual). Fold the current requirement baseline from the session log - goal, explicit constraints, must-preserve behavior, allowed scope, and settled user decisions. Inspect the current workspace and conversation, then decide whether the work in progress still matches the baseline. If an action you are about to take (or already took) would materially change the direction - scope expansion, constraint conflict, user-visible behavior change, architecture or product-shape shift, invalidated assumption, or a user direction change - run the drift protocol: call report_drift and follow the user's decision. Otherwise state briefly that the task is still aligned and continue. This check never blocks execution and never replaces plan mode.`;
+export const MANUAL_CHECK_MESSAGE = `Requirements Alignment check (manual). Use the current requirement baseline reported below (goal, explicit constraints, must-preserve behavior, allowed scope, and settled user decisions) — that is the durable sidecar state for this session, not the session event log. Inspect the current workspace and conversation, then decide whether the work in progress still matches the baseline. If an action you are about to take (or already took) would materially change the direction - scope expansion, constraint conflict, user-visible behavior change, architecture or product-shape shift, data-model change, compatibility change, invalidated assumption, or a user direction change - run the drift protocol: call report_drift and follow the user's decision. Otherwise state briefly that the task is still aligned and continue. This check never blocks execution and never replaces plan mode.`;
 
 /**
  * Render the auto-mode policy section text for one session: the policy plus

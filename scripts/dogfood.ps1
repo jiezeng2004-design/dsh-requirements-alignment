@@ -461,12 +461,12 @@ if ($final10.Count -eq 1) {
 }
 }
 
-# ---------------------------------------------- case 10: interruption durability
+# ---------------------------------------------- case 11: interruption durability
 # Protocol-forced mechanism: approve, then HALT before establish_baseline. The
-# driver stops the process right after the decision event; the folded status
-# at that point - and the fold of the PERSISTED session log - must be
+# driver stops the process right after the decision; the in-memory sidecar
+# view - and the fold of the PERSISTED sidecar document - must be
 # baseline-update-pending, never aligned. The post-resume establish_baseline
-# call is then simulated on the same log: aligned, revision +1.
+# call is then simulated on the same sidecar record: aligned, revision +1.
 if (Should-Run '11-interrupt') {
 $r11 = Invoke-Scenario -Name '11-interrupt' -Task 'This app is single-user and local-only: no accounts, no server, no cloud - keep it that way. First record the current requirement baseline (goal: keep the local-only task manager working; explicitConstraints: no accounts, no server, no cloud) with establish_baseline. I am now changing direction: make it work across devices. Run the drift protocol with the default options and follow the user decision, then implement.' -WorkDir (Join-Path $scenarioRoot '11-interrupt') -Overlay '11-interrupt.yml' -RecordFile '11-interrupt.jsonl' -ExpectRoundsMin 1 -ExpectRoundsMax 1 -QuestionTopicPattern 'direction|drift|sync|device|change'
 Add-Check $r11.ok '11-interrupt : drift question asked, process halted after the decision, exit 0'
@@ -485,9 +485,9 @@ if ($halt11.Count -eq 1) {
     $foldOut = (& node $foldScript $dshHome $sessionId11 2>&1 | Out-String)
     Write-Log '11-interrupt.fold.json' $foldOut
     $fold11 = $foldOut | ConvertFrom-Json
-    Add-Check ($fold11.found -and $fold11.before.status -eq 'baseline-update-pending') "11-interrupt : PERSISTED session log folds to baseline-update-pending (durable, got $($fold11.before.status))"
+    Add-Check ($fold11.found -and $fold11.source -eq 'sidecar' -and $fold11.before.status -eq 'baseline-update-pending') "11-interrupt : PERSISTED sidecar folds to baseline-update-pending (durable, source=$($fold11.source), got $($fold11.before.status))"
     if ($fold11.found) {
-        Add-Check ($fold11.before.revision -ge 1) "11-interrupt : persisted log keeps baseline revision $($fold11.before.revision)"
+        Add-Check ($fold11.before.revision -ge 1) "11-interrupt : persisted sidecar keeps baseline revision $($fold11.before.revision)"
         $resumeOut = (& node $foldScript $dshHome $sessionId11 --simulate-update 'Make it work across devices' 2>&1 | Out-String)
         Write-Log '11-interrupt.resume.json' $resumeOut
         $resume11 = $resumeOut | ConvertFrom-Json
@@ -499,14 +499,14 @@ if ($halt11.Count -eq 1) {
 }
 }
 
-# ----------------------------------------- case 11: revise-interruption durability
+# ----------------------------------------- case 12: revise-interruption durability
 # Protocol-forced mechanism: the user picks a model-supplied alternative
-# direction (revise + note), then HALT before establish_baseline. The folded
-# status at that point - and the fold of the PERSISTED session log - must be
-# baseline-update-pending, the durable decision event must keep the EXACT
-# chosen direction, and the summary projection (what a resumed session's
-# system prompt shows) must contain that direction verbatim - so the resumed
-# agent never re-asks what the user picked.
+# direction (revise + note), then HALT before establish_baseline. The sidecar
+# status at that point - and the fold of the PERSISTED sidecar document - must
+# be baseline-update-pending, the durable decision must keep the EXACT chosen
+# direction, and the summary projection (what a resumed session's system
+# prompt shows) must contain that direction verbatim - so the resumed agent
+# never re-asks what the user picked.
 if (Should-Run '12-interrupt-revise') {
 $r12 = Invoke-Scenario -Name '12-interrupt-revise' -Task 'This app is single-user and local-only: no accounts, no server, no cloud - keep it that way. First record the current requirement baseline (goal: keep the local-only task manager working; explicitConstraints: no accounts, no server, no cloud) with establish_baseline. I am now changing direction: make the task list work across devices. There are two candidate directions: "Use export files" (export/import a portable JSON file) or "Add cloud sync" (accounts and a sync service). Run the drift protocol: call report_drift with exactly these two directions as its options; the user will pick one and you must follow the pick, then implement.' -WorkDir (Join-Path $scenarioRoot '12-interrupt-revise') -Overlay '12-interrupt-revise.yml' -RecordFile '12-interrupt-revise.jsonl' -ExpectRoundsMin 1 -ExpectRoundsMax 1 -QuestionTopicPattern 'direction|drift|export|sync|device|change'
 Add-Check $r12.ok '12-interrupt-revise : drift question asked exactly once, process halted after the decision, exit 0'
@@ -528,10 +528,10 @@ if ($halt12.Count -eq 1) {
     $foldOut = (& node $foldScript $dshHome $sessionId12 2>&1 | Out-String)
     Write-Log '12-interrupt-revise.fold.json' $foldOut
     $fold12 = $foldOut | ConvertFrom-Json
-    Add-Check ($fold12.found -and $fold12.before.status -eq 'baseline-update-pending') "12-interrupt-revise : PERSISTED session log folds to baseline-update-pending (durable, got $($fold12.before.status))"
+    Add-Check ($fold12.found -and $fold12.source -eq 'sidecar' -and $fold12.before.status -eq 'baseline-update-pending') "12-interrupt-revise : PERSISTED sidecar folds to baseline-update-pending (durable, source=$($fold12.source), got $($fold12.before.status))"
     if ($fold12.found) {
         $ld12 = $fold12.before.lastDecision
-        Add-Check ($null -ne $ld12 -and $ld12.decision -eq 'revise' -and $ld12.note -match 'Use export files') '12-interrupt-revise : the exact chosen direction is durable in the persisted decision event'
+        Add-Check ($null -ne $ld12 -and $ld12.decision -eq 'revise' -and $ld12.note -match 'Use export files') '12-interrupt-revise : the exact chosen direction is durable in the persisted sidecar decision'
         Add-Check ($fold12.summary -match 'Use export files') '12-interrupt-revise : the resumed summary projects the exact chosen direction (lastDecision.note)'
         Add-Check ($fold12.summary -match 'Baseline update pending') '12-interrupt-revise : the resumed summary calls out the pending baseline update'
         $resumeOut = (& node $foldScript $dshHome $sessionId12 --simulate-update 'Make it work across devices' 2>&1 | Out-String)

@@ -38,6 +38,7 @@ test('align-driver: accepts a record path, run flag, and isolation flag', () => 
     assert.deepEqual(resolveAlignDriverConfig({ recordPath: 'records/r.jsonl' }), { recordPath: 'records/r.jsonl' });
     assert.deepEqual(resolveAlignDriverConfig({ injectAskUserCall: true }), { injectAskUserCall: true });
     assert.deepEqual(resolveAlignDriverConfig({ runAlign: true }), { runAlign: true });
+    assert.deepEqual(resolveAlignDriverConfig({ runBaselineProbe: true }), { runBaselineProbe: true });
     assert.deepEqual(resolveAlignDriverConfig({ recordPath: 'r.jsonl', runAlign: false, injectAskUserCall: false }), {
         recordPath: 'r.jsonl',
         runAlign: false,
@@ -69,6 +70,7 @@ test('align-driver: rejects unknown keys', () => {
 test('align-driver: rejects non-boolean flags', () => {
     assert.throws(() => resolveAlignDriverConfig({ injectAskUserCall: 'yes' } as never), /injectAskUserCall must be a boolean/);
     assert.throws(() => resolveAlignDriverConfig({ runAlign: 1 } as never), /runAlign must be a boolean/);
+    assert.throws(() => resolveAlignDriverConfig({ runBaselineProbe: 1 } as never), /runBaselineProbe must be a boolean/);
     assert.throws(() => resolveAlignDriverConfig({ snapshotFirstMutation: 'yes' } as never), /snapshotFirstMutation must be a boolean/);
     assert.throws(() => resolveAlignDriverConfig({ haltAtDecision: 1 } as never), /haltAtDecision must be a boolean/);
     assert.throws(() => resolveAlignDriverConfig({ verifyPolicySection: 'yes' } as never), /verifyPolicySection must be a boolean/);

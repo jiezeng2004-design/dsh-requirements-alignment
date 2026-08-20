@@ -1,18 +1,17 @@
 /**
- * Dogfood-only helper: fold the PERSISTED session log of an interrupted DSH
- * run with the plugin's own fold functions, and optionally simulate the
- * post-resume `establish_baseline` call (the exact event the tool would append
- * on a resumed session).
+ * Dogfood-only helper: fold the PERSISTED alignment state of an interrupted
+ * DSH run from the canonical sidecar (`storages/requirements_alignment.json`),
+ * and optionally simulate the post-resume `establish_baseline` call.
  *
  * Usage:
  *   node scripts/fold-session.mjs <dshHome> <sessionId> [--simulate-update <goal>]
  *
  * Output (JSON):
- *   { found, file, events, before: <foldAlignmentStatus>, after?: <foldAlignmentStatus> }
+ *   { found, source, file, before: <AlignmentStatus>, summary, after? }
  *
- * The fold runs over the durable on-disk log (zstd frames + chunk-run
- * expansion, decoded exactly like the DSH read path), not a live session, so
- * the result is what resume / fork / compaction would reconstruct.
+ * Prefers the sidecar (v0.2.2+ canonical medium). Falls back to the legacy
+ * session-log fold only when the sidecar has no record for this session —
+ * old v0.1/v0.2 artifacts, never a live production path.
  */
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
@@ -21,6 +20,11 @@ import { decodeStorageRecord } from '@deepseek-ai/dsh-session';
 import { foldAlignmentStatus, foldRequirementBaseline } from '../lib/status.js';
 import { buildBaseline } from '../lib/baseline-tool.js';
 import { baselineSummary } from '../lib/policy.js';
+import {
+    parseSidecarDocument,
+    statusFromSidecarRecord,
+    simulateSidecarBaselineUpdate
+} from '../lib/sidecar-fold.js';
 
 const [dshHome, sessionId, ...rest] = process.argv.slice(2);
 const simulateIndex = rest.indexOf('--simulate-update');
@@ -29,6 +33,36 @@ const simulateGoal = simulateIndex >= 0 ? rest[simulateIndex + 1] : undefined;
 if (!dshHome || !sessionId) {
     console.error('usage: node scripts/fold-session.mjs <dshHome> <sessionId> [--simulate-update <goal>]');
     process.exit(2);
+}
+
+/** Recursively find a file whose basename matches `name`. */
+function findFileNamed(root, name) {
+    if (!existsSync(root)) return undefined;
+    const queue = [root];
+    while (queue.length > 0) {
+        const dir = queue.shift();
+        let entries;
+        try {
+            entries = readdirSync(dir);
+        } catch {
+            continue;
+        }
+        for (const entry of entries) {
+            const path = join(dir, entry);
+            let st;
+            try {
+                st = statSync(path);
+            } catch {
+                continue;
+            }
+            if (st.isDirectory()) {
+                queue.push(path);
+            } else if (entry === name) {
+                return path;
+            }
+        }
+    }
+    return undefined;
 }
 
 /** Recursively find the session log file for one session id. */
@@ -127,22 +161,70 @@ function readEvents(file) {
     return events;
 }
 
-const file = findSessionFile(dshHome, sessionId);
-if (file === undefined) {
-    console.log(JSON.stringify({ found: false, sessionId }, null, 2));
-    process.exit(1);
+function foldFromSidecar() {
+    const direct = join(dshHome, 'storages', 'requirements_alignment.json');
+    const file = existsSync(direct) ? direct : findFileNamed(dshHome, 'requirements_alignment.json');
+    if (file === undefined) return undefined;
+    const sessions = parseSidecarDocument(readFileSync(file, 'utf8'));
+    const record = sessions[sessionId];
+    if (record === undefined) return { file, record: undefined };
+    const before = statusFromSidecarRecord(record);
+    const out = {
+        found: true,
+        source: 'sidecar',
+        file,
+        before,
+        summary: baselineSummary(before)
+    };
+    if (simulateGoal !== undefined) {
+        out.after = simulateSidecarBaselineUpdate(record, simulateGoal);
+    }
+    return out;
 }
-const events = readEvents(file);
-const before = foldAlignmentStatus(events);
-// The exact baseline-summary block a resumed session would see appended to
-// its system-prompt policy section (autoPolicyText projection).
-const out = { found: true, file, events: events.length, before, summary: baselineSummary(before) };
 
-if (simulateGoal !== undefined) {
-    const current = foldRequirementBaseline(events);
-    const baseline = buildBaseline({ goal: simulateGoal }, current, Date.now());
-    const simulated = [...events, { seq: Math.max(0, ...events.map((e) => e.seq)) + 1, time: Date.now(), type: 'alignment/baseline-updated', data: { baseline } }];
-    out.after = foldAlignmentStatus(simulated);
+function foldFromSessionLog() {
+    const file = findSessionFile(dshHome, sessionId);
+    if (file === undefined) return undefined;
+    const events = readEvents(file);
+    const before = foldAlignmentStatus(events);
+    const out = {
+        found: true,
+        source: 'session-log',
+        file,
+        events: events.length,
+        before,
+        summary: baselineSummary(before)
+    };
+    if (simulateGoal !== undefined) {
+        const current = foldRequirementBaseline(events);
+        const baseline = buildBaseline({ goal: simulateGoal }, current, Date.now());
+        const simulated = [...events, {
+            seq: Math.max(0, ...events.map((e) => e.seq)) + 1,
+            time: Date.now(),
+            type: 'alignment/baseline-updated',
+            data: { baseline }
+        }];
+        out.after = foldAlignmentStatus(simulated);
+    }
+    return out;
 }
 
-console.log(JSON.stringify(out, null, 2));
+const sidecar = foldFromSidecar();
+if (sidecar?.found === true) {
+    console.log(JSON.stringify(sidecar, null, 2));
+    process.exit(0);
+}
+
+const legacy = foldFromSessionLog();
+if (legacy !== undefined) {
+    console.log(JSON.stringify(legacy, null, 2));
+    process.exit(0);
+}
+
+console.log(JSON.stringify({
+    found: false,
+    sessionId,
+    sidecarFile: sidecar?.file,
+    hint: 'no sidecar record and no session log for this id'
+}, null, 2));
+process.exit(1);
