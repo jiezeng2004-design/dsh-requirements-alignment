@@ -31,7 +31,8 @@ Plan Mode is the official review-approve step *before* implementation. Requireme
 | System-prompt policy section | In `auto` mode (default) the drift-guard policy is contributed to every agent's prompt at order 60. It teaches the agent to hold a requirement baseline, monitor silently, and detect direction-level drift — scope expansion, constraint conflict, user-visible behavior change, architecture shift, invalidated assumptions, user direction change. |
 | `establish_baseline` tool | Records the baseline (goal, `explicitConstraints`, `mustPreserve`, `allowedScope`, `userDecisions`, `openDirectionDecisions`). Silent — it never asks the user. Recording again bumps the baseline revision. |
 | `report_drift` tool | Records a drift candidate (`reason`, `description`, `requiredChange`), asks you one question through the native user-questions channel, and records your decision. The default approve / stay-within-scope options are always offered; the two defaults map to `approve` / `reject`, a model-supplied alternative direction you pick — or your own free-text answer — maps to `revise` with your exact words as the note, never to a silent rejection. The tool result returns your exact choice (the `note`) and the required baseline change to the agent, so it never re-asks what you picked. Only alignment state managed by this plugin contributes to the requirement baseline — unrelated `ask_user_question` calls (plan mode, other plugins) never pollute it. |
-| `/align` command | Manual entry: reports the current alignment status (baseline revision, goal, protected constraints, drift count, last drift, last decision, current status) and steers a fresh alignment inspection into the agent. It inspects; it never blocks execution. |
+| `/align` command | Manual entry: reports the current alignment status (baseline revision, goal, protected constraints, drift count, last drift, last decision, current status, and whether the mode is the profile default or a runtime override) and steers a fresh alignment inspection into the agent. It inspects; it never blocks execution. |
+| `/align-mode` command | Always-on mode switch. No argument prints the three-layer snapshot (effective / profile default / runtime override). `/align-mode auto\|manual\|off` persists a runtime override; `/align-mode reset` drops it. Stays registered in Off so a live switch to Off is reversible without editing `settings.yaml`. |
 | Durable state | Canonical alignment state is written to the durable `AlignmentStateStore` sidecar (official `storage-domain` → `storage-json` backend), keyed by session lifecycle identity, so it survives resume, fork, and compaction — and a bare DSH build without this plugin still reads new sessions. The session log itself only ever receives official DSH events; `alignment/*` remains a legacy/migration/fold fallback only. |
 
 ## Installation
@@ -45,7 +46,7 @@ dsh plugin --profile web add dsh-requirements-alignment
 
 The plugin is a **profile bundle** (`dsh.bundle.patch` + `cordis.patch.yml`), so it installs through the standard plugin mechanism and adds two rows:
 
-- `requirements-alignment` — the controller (policy section, `/align`, both tools);
+- `requirements-alignment` — the controller (policy section, `/align`, `/align-mode`, both tools);
 - `requirements-alignment-ask-user` — the model-facing question tool.
 
 ## Quick Start
@@ -60,32 +61,52 @@ Use `/align` any time you want to inspect whether the current execution still ma
 
 ## Choose how alignment runs
 
-The plugin exposes `mode: auto | manual | off` through its configuration schema for validation and configuration loading. In the current DSH Web release, third-party plugin configuration is not automatically surfaced as a Settings UI control, so the mode is configured through the profile bundle configuration.
+Alignment mode is a **three-layer model** that can change at runtime without a profile restart:
+
+```text
+valid persisted override  ->  valid profile default  ->  auto
+```
+
+| Layer | Source | Persisted where |
+|---|---|---|
+| **Profile Default** (`defaultMode`) | The composition/profile config — `mode: auto|manual|off` in the profile bundle (`cordis.patch.yml`), default `auto` when absent. | Profile composition |
+| **Runtime Override** (`overrideMode`) | Your runtime switching (`setMode` / the settings document). | `settings.yaml` via the DSH Settings service (`@deepseek-ai/dsh-settings`) |
+| **Effective Mode** | `effectiveMode = valid override ?? valid default ?? auto`; **Effective Source** reports which layer produced it (`override` / `profile`). | derived |
 
 ```yaml
 - id: requirements-alignment
   name: dsh-requirements-alignment
   config:
-    mode: auto
+    mode: auto          # profile default; a runtime override wins over this
 ```
 
-After you change `mode` in the profile bundle, restart the current DSH Web profile so it starts with the new composition config.
+- **Profile Default** — the composition layer. It is the fallback when no override exists. Changing it (or the override) never rewrites the other; switching modes never edits the profile YAML.
+- **Runtime Override** — switching Auto → Manual → Off at runtime is persisted through the DSH Settings service, so a DSH restart restores `effective = your last override`. An invalid persisted value (for example a hand-edited `mode: banana`) never fails startup: the plugin falls back to the profile default and repairs the document once.
+- **Reset to Profile Default** — resetting (a `resetMode` call or replacing the settings section with `{}`) drops the override. `effective = defaultMode`, source = `profile`. It never re-writes the current effective mode as a new override.
+
+**Hot switching** — mode transitions are real register/dispose operations (`AlignmentRuntime`), not a "change the config and restart" step. Auto → Manual → Off → Auto can be cycled live with no duplicates, no listener leaks, and no profile restart. (`/align`, `establish_baseline`, `report_drift`, and `/align-migrate` are registered or disposed with the mode.) `/align-mode` is the always-on control command: Off unregisters alignment capabilities but keeps `/align-mode` so you can switch back.
+
+> **Runtime Mode backend: implemented.** **Native Web Settings UI: not implemented** (that would need a DSH Core patch). The user-facing switch in this release is `/align-mode`; the runtime override is also persisted through the official DSH Settings service (`@deepseek-ai/dsh-settings`), and an external `settings.yaml` hot edit is picked up live. The profile default remains `mode:` in the profile bundle.
 
 **Auto is the recommended default.** Clear tasks run with zero interruption; you are only asked when the execution is about to change direction.
 
-| Mode | Policy section | Alignment tools (`establish_baseline`, `report_drift`) | `/align` |
-|---|---|---|---|
-| **Auto** (recommended) | yes | yes | yes |
-| **Manual** | no | yes | yes |
-| **Off** | no | no | no |
+| Mode | Policy section | Alignment tools (`establish_baseline`, `report_drift`) | `/align` (+ `/align-migrate`) | `/align-mode` |
+|---|---|---|---|---|
+| **Auto** (recommended) | yes | yes | yes | yes |
+| **Manual** | no | yes | yes | yes |
+| **Off** | no | no | no | yes |
 
 - **Auto** — the drift-guard policy is in every agent's system prompt. The agent records a light baseline when the request carries protected scope, stays silent otherwise, and calls `report_drift` only for a real direction change.
 - **Manual** — no automatic policy. The agent works normally until you run `/align`, which reports status and steers a fresh inspection.
-- **Off** — the plugin stays installed but registers nothing: no policy, no alignment tools, no `/align`.
+- **Off** — the plugin stays installed but unregisters alignment capabilities: no policy, no alignment tools, no `/align`. `/align-mode` stays so you can switch back to Auto or Manual without editing the profile or `settings.yaml`.
+
+### State is never lost by switching modes
+
+Canonical alignment state (baselines, drifts, decisions, manual checks) lives in the **independent** `AlignmentStateStore` sidecar. Switching Auto → Manual → Off → Auto only changes which runtime capabilities are registered; it never deletes a baseline, never deletes the sidecar, never clears state, and never rewrites session events. A baseline established in Auto is still there after Off and back.
 
 ### Off ≠ Uninstall
 
-`mode: off` leaves the bundle in the profile. The row is still loaded, no alignment tools or policy are registered, and you can switch back to Auto or Manual by changing `mode`. That is not the same as uninstalling. (A session that predates the persistence-compatibility fix may still carry legacy `alignment/*` events in its log; current production never appends them.)
+`mode: off` (as profile default or as a runtime override) leaves the bundle in the profile. The row is still loaded, no alignment tools or policy are registered, and you can switch back to Auto or Manual live. That is not the same as uninstalling. (A session that predates the persistence-compatibility fix may still carry legacy `alignment/*` events in its log; current production never appends them.)
 
 ```yaml
 # disable the controller only (leaves the ask-user tool mounted)
@@ -99,7 +120,7 @@ After you change `mode` in the profile bundle, restart the current DSH Web profi
 dsh plugin --profile web rm dsh-requirements-alignment
 ```
 
-Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the `/align` command, and both tools. Canonical alignment state remains in the durable sidecar. Only sessions written by older versions keep legacy `alignment/*` events in their log — the current plugin never appends them to live sessions.
+Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the `/align` + `/align-migrate` + `/align-mode` commands, and both tools. Canonical alignment state remains in the durable sidecar. Only sessions written by older versions keep legacy `alignment/*` events in their log — the current plugin never appends them to live sessions.
 
 ## Auto mode (default)
 
@@ -128,7 +149,13 @@ Manual mode contributes no policy section — the agent works normally until you
 /align
 ```
 
-`/align` records the inspection, reports the current alignment status, and steers a fresh alignment check into the agent (which may then run the drift protocol if it finds a candidate). It never takes over the workflow and never blocks execution.
+`/align` records the inspection, reports the current alignment status, and steers a fresh alignment check into the agent (which may then run the drift protocol if it finds a candidate). It never takes over the workflow and never blocks execution. The steered check uses the durable sidecar baseline, not the session event log.
+
+```
+/align-mode          # show effective / profile default / runtime override
+/align-mode manual   # persist a runtime override and hot-switch now
+/align-mode reset    # drop the override; return to the profile default
+```
 
 ## Example interaction
 
@@ -189,7 +216,7 @@ DSH child agents cannot ask the user (`ask_user_question` and `report_drift` rej
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `auto` | `auto` — policy section + tools + command; `manual` — tools + command only; `off` — inert (row loaded, nothing registered). |
+| `mode` | `auto` | **Profile default layer** of the runtime mode (`auto` — policy section + tools + commands; `manual` — tools + commands only; `off` — inert, nothing registered). A valid persisted runtime override wins over it at startup and while running; reset drops the override and returns to this value. |
 | `section` | shipped policy | Deployment-owned policy text replacing the shipped one (auto mode). Must be non-empty when provided. |
 
 Unknown config keys fail at load (same stance as `dsh-plan-mode`).
@@ -197,7 +224,7 @@ Unknown config keys fail at load (same stance as `dsh-plan-mode`).
 ## Safety boundary
 
 - **No Core modifications.** Zero changes to `@deepseek-ai/*` packages; the only host-side file touched is the profile's bundle list / patch, which is exactly the mechanism DSH provides for installing plugins.
-- **Question channel only.** The plugin never reads or writes the user's data; it appends log-only session events and steers one user message on `/align`.
+- **Question channel + durable sidecar.** The plugin never inspects the user's workspace files. It writes alignment state to the official `storage-domain` sidecar, persists a runtime mode override through the DSH Settings service when one is mounted, and steers one user message on `/align`. Production never appends `alignment/*` session events.
 - **No file access.** It does not inspect the filesystem itself; the agent does that with its own tools under the normal sandbox.
 - **No background monitoring.** Drift detection is model-driven policy, not a watcher; there is no periodic interruption loop.
 
@@ -208,6 +235,9 @@ Unknown config keys fail at load (same stance as `dsh-plan-mode`).
 - **`/align` needs a command adapter.** UI-less spines (the headless profile, ACP automation) do not dispatch slash commands; the command is exercised by the Web client and by the unit tests / dogfood driver.
 - **Subagents cannot ask the user.** They report drift candidates to the parent, which owns the interaction.
 - **Baseline content is model-produced.** The fold is deterministic; what the model records as the baseline is the model's reading of the task. Keep prompts explicit when the direction matters.
+- **Sidecar grows append-only.** Every baseline, drift, decision, and manual check appends a whole-state checkpoint; there is no pruning yet. Very long sessions with many `/align` runs accumulate checkpoints (reads stay `O(1)` at the head, storage grows with the mutation count).
+- **No Web status projection.** Alignment status is surfaced through `/align` text and the per-session policy summary; there is no client-side status card or projection yet.
+- **No session-scoped mode in v0.3.0.** `/align-mode` changes the shared plugin/Profile runtime override, not only the calling session. A session-scoped selector is planned for v0.4.0 in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Testing and verification
 
@@ -251,6 +281,17 @@ The v0.2.2 persistence-compatibility gate verified:
 - `npm pack --dry-run` passes (exports targets all present; no v0.3.0 runtime-mode / hot-switch files)
 - DSH rc.6: `KNOWN_SESSION_EVENT_TYPES` = **44**, `alignment/*` = **0** official known event types
 
+The v0.3.0 runtime-mode / hot-switching gate verified:
+
+- Core modifications: **0**
+- Node tests: **176/176 passing** (v0.2.2 suite plus ModeStore, AlignmentRuntime, hot-switch, first-start rollback, external-failure, `/align-mode`, sidecar fold)
+- Hot-switch matrix: Auto → Manual, Manual → Auto, Auto → Off, Off → Auto, Manual → Off, Off → Manual — **PASS** (live register/dispose, exactly-one capability sets, no duplicates after repeated cycles)
+- Persistence independence: a baseline recorded in Auto survives Auto → Manual → Off → Auto
+- Runtime override persistence: startup restores a persisted override; reset returns to the profile default (`effectiveSource = profile`); an invalid persisted override falls back and repairs
+- Rollback: transition failure restores the prior mode; a settings persistence failure compensates the runtime back (no split-brain)
+- Persistence regression suite (cold resume, fork, historical fork, compaction, legacy migration): **PASS** — production writer still emits **zero** `alignment/*` events
+- Current-tarball packed add/boot/remove: **40/40** — clean profile with no source link; Auto / Manual / Off registries, `/align`, `/align-mode`, direct `establish_baseline`, uninstall, and manifest restoration verified. External model completion was unavailable (`QUOTA: Insufficient Balance`) and is reported separately rather than claimed as an E2E pass.
+
 Detailed evidence and the bounded-run caveat are recorded in `ACCEPTANCE.md`.
 
 ## Development
@@ -260,7 +301,7 @@ pnpm install          # dependencies
 pnpm run typecheck    # tsc (src + test)
 pnpm run lint         # eslint (src + test)
 pnpm run build        # tsc → lib/
-pnpm test             # node:test (133 tests)
+pnpm test             # node:test
 pnpm run check        # all of the above
 ```
 

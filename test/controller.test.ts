@@ -4,10 +4,12 @@ import { Context } from '@deepseek-ai/cordis';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import {
     RequirementsAlignmentController,
+    modeSnapshotText,
     statusText,
     statusValueText
 } from '../src/index.ts';
 import { POLICY_ORDER, POLICY_SECTION } from '../src/policy.ts';
+import { SETTINGS_NAMESPACE } from '../src/settings-mode-store.ts';
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands';
 import type { PromptSection } from '@deepseek-ai/dsh-system-prompt';
 import { fakeSession, fakeStorageDomain } from './helpers.ts';
@@ -52,6 +54,37 @@ async function mount(config: object) {
             return disposer;
         }
     });
+    // Persistable settings so `/align-mode` / setMode can commit an override.
+    const settingsDoc: Record<string, unknown> = {};
+    const settingsWatchers = new Set<() => void>();
+    ctx.provide('settings', {
+        register(ns: string, _schema: unknown, options?: { base?: Record<string, unknown> }) {
+            const base = options?.base ?? {};
+            return {
+                get: () => ({ ...base, ...((settingsDoc[ns] as Record<string, unknown> | undefined) ?? {}) }),
+                watch: (cb: () => void) => {
+                    settingsWatchers.add(cb);
+                    return () => settingsWatchers.delete(cb);
+                },
+                update: async (patch: object) => {
+                    settingsDoc[ns] = { ...((settingsDoc[ns] as Record<string, unknown> | undefined) ?? {}), ...patch };
+                    for (const cb of [...settingsWatchers]) cb();
+                },
+                replace: async (section: object) => {
+                    if (section && typeof section === 'object' && Object.keys(section).length === 0) {
+                        delete settingsDoc[ns];
+                    } else {
+                        settingsDoc[ns] = { ...(section as Record<string, unknown>) };
+                    }
+                    for (const cb of [...settingsWatchers]) cb();
+                }
+            };
+        },
+        describe: () => [{
+            ns: SETTINGS_NAMESPACE,
+            ...(settingsDoc[SETTINGS_NAMESPACE] === undefined ? {} : { user: settingsDoc[SETTINGS_NAMESPACE] })
+        }]
+    });
     // The storage-domain seam: the store attaches to it (as in the web
     // profile), so alignment writes are durable within the test process.
     const storage = fakeStorageDomain();
@@ -76,7 +109,7 @@ test('controller: auto mode registers the policy section, both commands, and bot
     assert.equal(sections.length, 1);
     assert.equal(sections[0]!.name, POLICY_SECTION);
     assert.equal(sections[0]!.order, POLICY_ORDER);
-    assert.deepEqual(commands.map((command) => command.name).sort(), ['align', 'align-migrate']);
+    assert.deepEqual(commands.map((command) => command.name).sort(), ['align', 'align-migrate', 'align-mode']);
     assert.deepEqual(tools.map((tool) => tool.name).sort(), ['establish_baseline', 'report_drift']);
 });
 
@@ -108,20 +141,20 @@ test('controller: section renders nothing without an agent (bare assemble)', asy
 test('controller: manual mode registers only the commands and tools, no section', async () => {
     const { sections, commands, tools } = await mount({ mode: 'manual' });
     assert.equal(sections.length, 0);
-    assert.deepEqual(commands.map((command) => command.name).sort(), ['align', 'align-migrate']);
+    assert.deepEqual(commands.map((command) => command.name).sort(), ['align', 'align-migrate', 'align-mode']);
     assert.deepEqual(tools.map((tool) => tool.name).sort(), ['establish_baseline', 'report_drift']);
 });
 
-test('controller: off mode registers nothing', async () => {
+test('controller: off mode registers only /align-mode', async () => {
     const { sections, commands, tools } = await mount({ mode: 'off' });
     assert.equal(sections.length, 0);
-    assert.equal(commands.length, 0);
+    assert.deepEqual(commands.map((command) => command.name), ['align-mode']);
     assert.equal(tools.length, 0);
 });
 
 test('controller: unload disposes every registration', async () => {
     const { sections, commands, tools, disposers } = await mount({ mode: 'auto' });
-    assert.ok(disposers.length >= 5);
+    assert.ok(disposers.length >= 6);
     for (const dispose of disposers) dispose();
     assert.equal(sections.length, 0);
     assert.equal(commands.length, 0);
@@ -152,6 +185,9 @@ test('controller: /align handler records the check in the store, steers the chec
     assert.equal(steered.length, 1);
     const message = steered[0] as { content: Array<{ type: string; text: string }>; source: { kind: string; plugin: string; form: string } };
     assert.match(message.content[0]!.text, /Requirements Alignment check \(manual\)/);
+    assert.match(message.content[0]!.text, /durable sidecar state/);
+    assert.match(message.content[0]!.text, /Baseline revision: 0/);
+    assert.match(message.content[0]!.text, /Mode: Auto \(profile default\)/);
     assert.equal(message.source.kind, 'plugin');
     assert.equal(message.source.plugin, 'requirements-alignment');
     assert.equal(message.source.form, 'notice');
@@ -237,6 +273,10 @@ test('statusText: includes Mode: Auto or Mode: Manual from live config, not the 
     assert.match(manual, /^Requirements Alignment\nMode: Manual\nBaseline revision: 0/m);
     assert.doesNotMatch(auto, /Mode: Manual/);
     assert.doesNotMatch(manual, /Mode: Auto/);
+    const autoOverride = statusText(status, 'auto', 'override');
+    const manualProfile = statusText(status, 'manual', 'profile');
+    assert.match(autoOverride, /Mode: Auto \(runtime override\)/);
+    assert.match(manualProfile, /Mode: Manual \(profile default\)/);
 });
 
 test('statusValueText: labels the four postures without gate claims', () => {
@@ -263,7 +303,8 @@ test('controller: public registration contract — Auto / Manual / Off', async (
         if (row.tools) {
             assert.deepEqual(tools.map((tool) => tool.name).sort(), ['establish_baseline', 'report_drift']);
         }
-        assert.equal(commands.length > 0, row.align, `${row.mode}: /align`);
+        assert.ok(commands.some((command) => command.name === 'align-mode'), `${row.mode}: /align-mode is always registered`);
+        assert.equal(commands.some((command) => command.name === 'align'), row.align, `${row.mode}: /align`);
         if (row.align) {
             const { session } = fakeSession();
             const result = await alignCommand(commands).handler({
@@ -277,7 +318,7 @@ test('controller: public registration contract — Auto / Manual / Off', async (
             assert.match(result.text ?? '', new RegExp(row.modeLine!));
             assert.doesNotMatch(result.text ?? '', /Mode: Off/);
         } else {
-            assert.equal(commands.length, 0);
+            assert.deepEqual(commands.map((command) => command.name), ['align-mode']);
             assert.equal(sections.length, 0);
             assert.equal(tools.length, 0);
         }
@@ -310,4 +351,89 @@ test('controller: /align reports baseline-update-pending after approve without a
     assert.match(text, /Baseline revision: 1/);
     assert.match(text, /Last user decision:\napprove/);
     assert.match(text, /Current status:\nBaseline update pending/);
+});
+
+function modeCommand(commands: CommandDefinition[]): CommandDefinition {
+    const found = commands.find((command) => command.name === 'align-mode');
+    assert.ok(found, '/align-mode must be registered');
+    return found;
+}
+
+test('controller: /align-mode with no args reports the three-layer snapshot', async () => {
+    const { commands } = await mount({ mode: 'auto' });
+    const { session } = fakeSession();
+    const result = await modeCommand(commands).handler({
+        agent: { session, steer: () => { } } as never,
+        rawInput: '',
+        signal: new AbortController().signal,
+        commandId: 'mode-status' as never
+    });
+    assert.equal(result.kind, 'success');
+    assert.match(result.text ?? '', /Effective: Auto \(profile default\)/);
+    assert.match(result.text ?? '', /Profile default: Auto/);
+    assert.match(result.text ?? '', /Runtime override: \(none\)/);
+});
+
+test('controller: /align-mode switches Off and back, including while Off', async () => {
+    const { commands, controller } = await mount({ mode: 'auto' });
+    const { session } = fakeSession();
+    const invoke = async (input: string) => modeCommand(commands).handler({
+        agent: { session, steer: () => { } } as never,
+        rawInput: input,
+        signal: new AbortController().signal,
+        commandId: `mode-${input || 'status'}` as never
+    });
+
+    const off = await invoke('off');
+    assert.equal(off.kind, 'success');
+    assert.equal(controller.runtime.activeMode, 'off');
+    assert.match(off.text ?? '', /Switched to Off/);
+    assert.match(off.text ?? '', /Effective: Off \(runtime override\)/);
+    assert.equal(commands.some((command) => command.name === 'align'), false, '/align unregistered in Off');
+    assert.ok(commands.some((command) => command.name === 'align-mode'), '/align-mode survives Off');
+
+    const back = await invoke('auto');
+    assert.equal(back.kind, 'success');
+    assert.equal(controller.runtime.activeMode, 'auto');
+    assert.match(back.text ?? '', /Switched to Auto/);
+    assert.ok(commands.some((command) => command.name === 'align'), '/align returns with Auto');
+});
+
+test('controller: /align-mode reset drops the override; invalid input is an error', async () => {
+    const { commands, controller } = await mount({ mode: 'manual' });
+    const { session } = fakeSession();
+    await controller.setMode('off');
+    const reset = await modeCommand(commands).handler({
+        agent: { session, steer: () => { } } as never,
+        rawInput: 'reset',
+        signal: new AbortController().signal,
+        commandId: 'mode-reset' as never
+    });
+    assert.equal(reset.kind, 'success');
+    assert.equal(controller.runtime.activeMode, 'manual');
+    assert.equal(controller.modeStore.getSnapshot().effectiveSource, 'profile');
+    assert.match(reset.text ?? '', /Reset to the profile default/);
+
+    const bad = await modeCommand(commands).handler({
+        agent: { session, steer: () => { } } as never,
+        rawInput: 'banana',
+        signal: new AbortController().signal,
+        commandId: 'mode-bad' as never
+    });
+    assert.equal(bad.kind, 'error');
+    assert.match(bad.text ?? '', /Usage: \/align-mode/);
+});
+
+test('modeSnapshotText: names profile vs override layers', () => {
+    assert.match(modeSnapshotText({
+        defaultMode: 'auto',
+        effectiveMode: 'auto',
+        effectiveSource: 'profile'
+    }), /Runtime override: \(none\)/);
+    assert.match(modeSnapshotText({
+        defaultMode: 'auto',
+        overrideMode: 'manual',
+        effectiveMode: 'manual',
+        effectiveSource: 'override'
+    }), /Effective: Manual \(runtime override\)/);
 });

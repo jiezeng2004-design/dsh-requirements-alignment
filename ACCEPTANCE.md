@@ -1,3 +1,43 @@
+# Acceptance report — dsh-requirements-alignment v0.3.0
+
+Date: 2026-08-20 · package 0.3.0 · DSH 0.1.0-rc.6 · workspace: `<local-workspace>`
+
+v0.3.0 is the **persistent runtime mode & hot-switching** release on top of
+the v0.2.2 sidecar. Direction is unchanged: the plugin is a soft runtime
+drift guard. This round makes Auto / Manual / Off a live three-layer model
+and gives the user a Core-free switch (`/align-mode`).
+
+## v0.3.0 checklist
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | `/align-mode` always registered, including Off | ✅ | AlignmentRuntime control group; Off → Auto via the command in unit tests. |
+| 2 | `/align` reports profile default vs runtime override | ✅ | `statusText(..., source)`; steered `/align` message includes the report. |
+| 3 | Manual check does not fold the session log | ✅ | `MANUAL_CHECK_MESSAGE` names the sidecar; policy tests lock that in. |
+| 4 | Dogfood 11/12 fold the sidecar | ✅ | `scripts/fold-session.mjs` + `src/sidecar-fold.ts`; session-log fold is fallback only. |
+| 5 | Invalid override repair is repeatable | ✅ | ModeStore resets the in-flight flag after each repair. |
+| 6 | `setMode` uses pending compensation | ✅ | Persist + runtime-rollback double fault parks `pendingCompensation`. |
+| 7 | No DSH Core changes | ✅ | Settings service + `/align-mode`; no native Settings UI card. |
+| 8 | Production still appends zero `alignment/*` | ✅ | Persistence regression suite. |
+| 9 | First-start registration failure leaves no interactive half-state | ✅ | `null -> Auto` failure keeps only always-on `/align-mode`; a later retry recovers. |
+| 10 | Fresh tarball install cannot drift beyond the verified DSH rc.6 seam | ✅ | Runtime DSH dependencies use exact `0.1.0-rc.6`; packed smoke starts from a profile with no source link. |
+
+Node tests: **176/176 passing**; typecheck, lint, and build green.
+
+Current-tarball packed smoke: **40/40 checks passed**. The disposable profile
+starts without a source link, installs `0.3.0` as an isolated package, verifies
+Auto / Manual / Off through real DSH registries, executes `/align`, calls
+`establish_baseline` through the real tools registry, removes the plugin, and
+verifies manifest/package-list restoration. The external model completion was
+unavailable during this run (`QUOTA: Insufficient Balance`); that layer is
+reported separately and is not presented as a successful model E2E run.
+
+Native Web Settings UI remains out of scope (would need a DSH Core patch).
+Session-scoped mode selection is planned for v0.4.0 in `docs/ROADMAP.md`.
+Web status projection and `mode: guard` remain deferred.
+
+---
+
 # Acceptance report — dsh-requirements-alignment v0.2.0 (RC)
 
 Date: 2026-08-16 (round 2) · package 0.2.0 · DSH 0.1.0-rc.6 · workspace: `<local-workspace>`

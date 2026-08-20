@@ -27,12 +27,30 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
 /**
  * Runtime alignment operation mode: `auto` contributes the policy section,
  * tools, and `/align`; `manual` keeps tools and `/align` only; `off`
- * registers nothing.
+ * unregisters those capabilities but keeps `/align-mode` so the user can
+ * switch back.
  */
 export type AlignmentMode = 'auto' | 'manual' | 'off';
 
 /** Legal mode names, used by the configuration schema and validation. */
 export const ALIGNMENT_MODES = ['auto', 'manual', 'off'] as const;
+
+/** Narrow an unknown value to an {@link AlignmentMode}. */
+export function isAlignmentMode(value: unknown): value is AlignmentMode {
+    return value === 'auto' || value === 'manual' || value === 'off';
+}
+
+/**
+ * Validate an unknown mode, returning it narrowed. Throws on anything that is
+ * not a legal {@link AlignmentMode} — the single validation used by config
+ * resolution, ModeStore writes, and runtime transitions.
+ */
+export function validateAlignmentMode(value: unknown): AlignmentMode {
+    if (!isAlignmentMode(value)) {
+        throw new Error(`requirements-alignment mode must be 'auto', 'manual', or 'off', got ${JSON.stringify(value)}`);
+    }
+    return value;
+}
 
 /**
  * Finite drift taxonomy. A drift candidate is a direction-level change, not a

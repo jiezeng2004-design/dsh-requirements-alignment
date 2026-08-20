@@ -2,6 +2,142 @@
 
 All notable changes to this project are documented here.
 
+## 0.3.0 - 2026-08-20
+
+### Added (persistent runtime mode & hot switching)
+
+- **ModeStore (`src/mode-store.ts`)** — the single authority over the runtime
+  alignment mode. Three-layer model
+  `valid persisted override -> valid profile default -> auto`. Exposes
+  `getSnapshot()` (default / override / effective / source), `setOverride`,
+  `resetOverride`, and `subscribe`; invalid stored overrides fall back to the
+  profile default and are repaired (never fail startup; a later invalid value
+  is repaired too).
+- **Settings-backed override persistence (`src/settings-mode-store.ts`)** —
+  runtime overrides persist through the official `@deepseek-ai/dsh-settings`
+  service (new dependency, rc.6; no DSH Core changes). A DSH restart restores
+  the last override; a permissive storage schema plus ModeStore validation
+  guarantee an invalid persisted value (e.g. `mode: banana`) stays inert, and
+  an external `settings.yaml` hot edit is applied live. Deployments without a
+  settings service degrade to an entry-only port.
+- **AlignmentRuntime (`src/runtime-mode-controller.ts`)** — real
+  register/dispose hot transitions. Auto registers the policy section, both
+  tools, `/align`, and `/align-migrate`; Manual registers tools + both
+  commands; Off unregisters those. `/align-mode` is always registered so a
+  live switch to Off is reversible. Transitions are idempotent, exactly-one by
+  construction, and failure-safe (partials disposed, previous mode restored).
+- **`/align-mode`** — user-facing mode switch that does not need a DSH Core
+  Settings card. No argument prints the three-layer snapshot; `auto` /
+  `manual` / `off` persist a runtime override; `reset` returns to the profile
+  default. `/align` now names whether the effective mode is the profile
+  default or a runtime override.
+- **Controller integration (`src/index.ts`)** — `RequirementsAlignmentController`
+  now owns `AlignmentStateStore` (unchanged sidecar), `ModeStore`, and
+  `RuntimeModeController`. Adds `setMode(mode)` (validate → transition →
+  persist, with persistence-failure rollback) and `resetMode()`; a startup
+  override is applied immediately.
+- **Mode persistence is independent of alignment state persistence.** Switching
+  modes never deletes a baseline, the sidecar, or session events.
+
+### Fixed (external-transition failure compensation)
+
+- A hot-edited settings document whose runtime transition fails (for example an
+  Auto policy registration error) no longer leaves a ModeStore/Runtime
+  split-brain (`{ effective: auto, runtime: manual }`). The controller
+  serializes hot-switch reconciliation and, on transition failure, restores the
+  persisted user layer to the source of the previous snapshot — a
+  `profile`-sourced previous is restored by resetting the override (no `mode:`
+  key written), an `override`-sourced previous by rewriting exactly its mode —
+  so ModeStore, Settings, and Runtime re-converge. Nothing is swallowed: the
+  failure is logged, the compensation is bounded (no recursion, no duplicate
+  registrations, no listener growth), and the path stays recoverable for later
+  external edits.
+
+### Fixed (compensation write double fault)
+
+- A transition failure whose compensation write ALSO fails no longer silently
+  ends in a permanent split-brain (`{ runtime: manual, settings: auto }`).
+  The controller now keeps a pending compensation (the previous snapshot whose
+  persisted source must be restored) and treats **runtime rollback as only the
+  first step**: while it is set, the runtime stays authoritative on the pending
+  target, and the very next reconciliation (any settings/document update)
+  settles it first — restore the persisted source, confirm the live snapshot
+  actually converged, then clear — before any newer desired transition runs.
+- Recovery is bounded and intent-preserving. Each trigger performs at most one
+  compensation write (a failed write never notifies, so a persistently broken
+  persistence layer parks the pending state until the next external trigger:
+  no busy loop, no recursion). If the pending restore clobbered a newer user
+  change, the latest desired snapshot is re-persisted after the restore settles,
+  so a `manual -> auto (fails) -> off` sequence converges to the latest intent
+  (`off`) through the transactional previous (`manual`) first.
+- The profile-vs-override restore semantics are unchanged: a `profile`-sourced
+  previous clears the override (no `mode:` key written), an
+  `override`-sourced previous rewrites exactly its mode.
+- Observability: the transition failure and the compensation-write failure are
+  logged as distinct events (`... failed; restoring previous ...` vs
+  `... failed to restore the persisted mode source ...; compensation remains
+  pending`), and a public `pendingCompensation` probe exposes the pending
+  rollback target.
+
+### Restored tests
+
+- `test/mode-store.test.ts` (11), `test/runtime-mode-controller.test.ts` (4),
+  `test/hot-switch.test.ts` (8) — ported from the v0.3 development backup and
+  adapted to the v0.2.2 architecture (store-backed tools, `/align-migrate` and
+  the always-on `/align-mode` in the command groups, state-preservation
+  matrix). All 133 v0.2.2 tests are unchanged and passing.
+- `test/external-settings-failure.test.ts` (11) — regression coverage for the
+  external-transition compensation: profile-source rollback, override-source
+  rollback, recoverability, and no-duplicates/no-recursion after failure +
+  compensation + retry, plus six double-fault cases (profile-source and
+  override-source compensation-write failure, recover-after-double-fault,
+  latest user intent, no busy retry, and no duplicates after a full
+  double-fault cycle) and the `setMode` rollback double fault.
+- `test/sidecar-fold.test.ts` (4) + `src/sidecar-fold.ts` — the sidecar-read
+  and simulated-resume helpers behind `scripts/fold-session.mjs`.
+
+### Fixed (release-ready follow-through)
+
+- **First-start registration failure is fully rolled back.** If the initial
+  `null -> Auto/Manual` transition fails, the runtime now keeps only the
+  always-on `/align-mode` control command; it no longer leaks `/align` and
+  `/align-migrate` while reporting `activeMode = null`. A regression test also
+  proves a later retry can recover normally.
+- **Fresh installs stay on the verified DSH rc.6 seam.** Runtime DSH package
+  dependencies are pinned to `0.1.0-rc.6` instead of prerelease caret ranges,
+  so a clean tarball install cannot silently mix newly published rc.7 packages
+  into the rc.6 profile validated by this release.
+- **`/align` no longer tells the model to fold the session log.** The manual
+  check message points at the durable sidecar baseline and the steered user
+  message now includes the current status report, so Manual mode can see the
+  baseline without a policy section.
+- **Dogfood 11/12 fold the sidecar.** `scripts/fold-session.mjs` reads
+  `storages/requirements_alignment.json` (legacy session-log fold is fallback
+  only).
+- **Invalid override repair is no longer one-shot.** A later illegal value
+  after a successful repair is cleared again.
+- **`setMode` / `resetMode` share pending compensation** with the external
+  settings path: a persist failure whose runtime rollback also fails no longer
+  silently split-brains.
+
+### Verification
+
+- Type checking, linting, and build passed.
+- Node tests: **176/176 passing**.
+- Current-tarball packed add/boot/remove smoke: **40/40**. The profile starts
+  without a source checkout link; Auto / Manual / Off, `/align`, `/align-mode`,
+  policy presence, tool registration, direct `establish_baseline`, uninstall,
+  and manifest restoration are verified through real DSH registries. External
+  model completion was unavailable (`QUOTA: Insufficient Balance`) and is not
+  counted as a model E2E pass.
+- Hot-switch matrix (all six cross-mode transitions): PASS, including Off →
+  Auto via `/align-mode`.
+- Persistence regression suite (cold resume / fork / historical fork /
+  compaction / legacy migration): PASS — production still emits zero
+  `alignment/*` session events.
+- Runtime Mode backend + `/align-mode`: implemented. Native Web Settings UI:
+  not implemented (no DSH Core patch this round).
+
 ## 0.2.2 - 2026-08-18
 
 ### Changed (DSH rc.6 persistence compatibility)

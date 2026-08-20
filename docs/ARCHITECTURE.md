@@ -4,6 +4,13 @@ Date: session 2026-08 (DSH 0.1.0-rc.6, local checkout at
 `<dsh-home>/profiles/node_modules/@deepseek-ai` + the launcher package
 `@deepseek-ai/dsh` from the pnpm dlx cache).
 
+**Canonical state (v0.2.2+):** alignment lives in the `AlignmentStateStore`
+sidecar (`storage-domain` → `storage-json`, unit `requirements_alignment`),
+keyed by session lifecycle identity. Production never appends `alignment/*`
+session events — those types exist only so legacy logs fold and migrate.
+v0.3.0 adds ModeStore + AlignmentRuntime hot switching and the always-on
+`/align-mode` command.
+
 ## 1. What v0.2 is
 
 v0.1 aligned direction *before* execution (greenfield gate + `ask_user_question`
@@ -30,9 +37,10 @@ alignment round. That is no longer usable, because:
 - other plugins and ordinary agent questions use the same tool;
 - the count said nothing about *direction*.
 
-v0.2 therefore owns **dedicated events** (`alignment/*`), written only by this
-plugin's two tools and the `/align` command. Unrelated `ask_user_question`
-calls are invisible to the alignment fold by construction.
+v0.2 therefore owns **dedicated alignment state**, written only by this
+plugin's two tools and the `/align` command. Since v0.2.2 that state is a
+sidecar checkpoint, not a session event. Unrelated `ask_user_question`
+calls are invisible to the alignment view by construction.
 
 ## 3. Requirement Baseline data model
 
@@ -54,22 +62,29 @@ specification. Baseline events are **whole-value snapshots** (the payload
 carries the complete post-change baseline, revision included) — the same rule
 as `plan/mode` — so the last baseline event alone reconstructs the state.
 
-## 4. Session events (log-only, durable, foldable)
+## 4. Canonical sidecar (v0.2.2+) and legacy session events
 
-| Event | Payload | Writer |
+Canonical writes go to `AlignmentStateStore` whole-state checkpoints
+`{ visibleThroughSeq, state }` in the `requirements_alignment` storage-domain
+unit. Resume, historical fork (`stateAt(seedLength - 1)`), and compaction
+read that timeline. Production appends **zero** `alignment/*` session events
+(a bare DSH reader would otherwise refuse the log).
+
+The `alignment/*` vocabulary below is **legacy only** — read for v0.1/v0.2
+logs, migration (`/align-migrate`), and fold-fallback when a parent has no
+sidecar record:
+
+| Event | Payload | Writer (legacy only) |
 |---|---|---|
 | `alignment/baseline` | `{ baseline }` | `establish_baseline` (first record, revision ≥ 1) |
 | `alignment/baseline-updated` | `{ baseline }` | `establish_baseline` (revision bump, whole-value replace) |
-| `alignment/drift` | `{ reason, description, requiredChange?, at }` | `report_drift` (appended *before* the question, so the candidate is durable even if the question fails) |
-| `alignment/decision` | `{ driftSeq, decision: 'approve'\|'reject'\|'revise', note?, at }` | `report_drift` (paired with the drift event by its `seq`) |
+| `alignment/drift` | `{ reason, description, requiredChange?, at }` | `report_drift` |
+| `alignment/decision` | `{ driftSeq, decision: 'approve'\|'reject'\|'revise', note?, at }` | `report_drift` |
 | `alignment/manual-check` | `{ at }` | `/align` |
 | `alignment/status` (legacy) | `{ kind: 'manual-check', at }` | v0.1 only — read for compatibility, never written |
 
-All events are non-surface (no `surfaceOp`), so they survive compaction
-(which rewrites only surface nodes), fork seeds (a child inherits the parent's
-baseline), and resume (the fold replays the stored log). The `SessionEventMap`
-module augmentation follows the exact DSH pattern of `plan/mode` and
-`command/run`.
+`SessionEventMap` augmentation is TypeScript-only; it is not runtime
+registration into `KNOWN_SESSION_EVENT_TYPES`.
 
 ## 5. Pure folds
 
@@ -81,8 +96,9 @@ foldAlignmentStatus(events): AlignmentStatus
 //   manualChecks, lastManualCheckAt? }
 ```
 
-`status` is derived purely from the log (no live mirror, no process state), so
-resume, fork, and compaction replay the same posture:
+`status` is derived purely from sidecar checkpoints (the legacy log fold is
+kept byte-identical for migration equivalence), so resume, fork, and
+compaction replay the same posture:
 
 1. the last drift has no paired decision → `drift-pending`;
 2. the last decision is `approve`/`revise` and no `alignment/baseline` /
@@ -171,7 +187,13 @@ drift (including its `requiredChange`), the last user decision with its note
 `baseline-update-pending` — names the chosen direction in the pending line,
 so a resumed session knows exactly what the user picked without re-asking.
 
-## 8. `/align` — inspection, not a gate
+## 8. `/align` and `/align-mode`
+
+`/align-mode` is the always-on control command (including Off): no argument
+prints the three-layer snapshot; `auto` / `manual` / `off` persist a runtime
+override; `reset` returns to the profile default.
+
+## 8b. `/align` — inspection, not a gate
 
 `/align` appends `alignment/manual-check`, folds the status, returns a
 multi-line report (revision, goal, protected constraints, drift count, last
@@ -213,7 +235,9 @@ pending-intent seam) without changing the event schema.
 | `ctx.userQuestions.ask()` | the drift question (native channel, agent + signal attached) |
 | `ctx.commands.register()` | `/align` (exact `CommandDefinition` contract) |
 | `agent.steer()` + `createUserMessage` | `/align` hands the fresh check to the agent |
-| `session.append()` + `SessionEventMap` augmentation | durable `alignment/*` events |
+| `ctx.storageDomain` | canonical `AlignmentStateStore` sidecar |
+| `ctx.get('settings')` / `settings.register` | runtime mode override (v0.3.0) |
+| `session.append()` + `SessionEventMap` augmentation | LEGACY `alignment/*` vocabulary only |
 | `agent/session-start`, `session/event` (driver) | dogfood-only snapshots + `/align` executor |
 | `ctx.inject(['commands'])` | optional dependency pattern (as `dsh-plan-mode`) |
 | bundle patch layers (`dsh.bundle.patch` + `cordis.patch.yml`) | install/remove via `dsh plugin add/rm` |

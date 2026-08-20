@@ -34,6 +34,8 @@ export interface AlignDriverConfig {
      * cases 6-7). Snapshots are recorded regardless.
      */
     runAlign?: boolean;
+    /** Execute establish_baseline through the real tools registry at session start (packed smoke; no model call required). */
+    runBaselineProbe?: boolean;
     /**
      * Append one synthetic `ask_user_question` tool call to every top-level
      * session before `/align`, to verify that unrelated questions never
@@ -79,6 +81,7 @@ export interface AlignDriverConfig {
 export interface ResolvedAlignDriverConfig {
     recordPath?: string;
     runAlign?: boolean;
+    runBaselineProbe?: boolean;
     injectAskUserCall?: boolean;
     snapshotFirstMutation?: boolean;
     haltAtDecision?: boolean;
@@ -88,15 +91,16 @@ export interface ResolvedAlignDriverConfig {
 
 /** Validate driver config; unknown keys fail loud. */
 export function resolveAlignDriverConfig(config: AlignDriverConfig = {}): ResolvedAlignDriverConfig {
-    const unknown = Object.keys(config).filter((key) => key !== 'recordPath' && key !== 'runAlign' && key !== 'injectAskUserCall' && key !== 'snapshotFirstMutation' && key !== 'haltAtDecision' && key !== 'verifyPolicySection' && key !== 'verifyRegistrations');
-    if (unknown.length > 0) throw new Error(`AlignDriverConfig has unknown key(s) ${unknown.join(', ')} - config is { recordPath?, runAlign?, injectAskUserCall?, snapshotFirstMutation?, haltAtDecision?, verifyPolicySection?, verifyRegistrations? }`);
-    for (const key of ['runAlign', 'injectAskUserCall', 'snapshotFirstMutation', 'haltAtDecision', 'verifyPolicySection', 'verifyRegistrations'] as const) {
+    const unknown = Object.keys(config).filter((key) => key !== 'recordPath' && key !== 'runAlign' && key !== 'runBaselineProbe' && key !== 'injectAskUserCall' && key !== 'snapshotFirstMutation' && key !== 'haltAtDecision' && key !== 'verifyPolicySection' && key !== 'verifyRegistrations');
+    if (unknown.length > 0) throw new Error(`AlignDriverConfig has unknown key(s) ${unknown.join(', ')} - config is { recordPath?, runAlign?, runBaselineProbe?, injectAskUserCall?, snapshotFirstMutation?, haltAtDecision?, verifyPolicySection?, verifyRegistrations? }`);
+    for (const key of ['runAlign', 'runBaselineProbe', 'injectAskUserCall', 'snapshotFirstMutation', 'haltAtDecision', 'verifyPolicySection', 'verifyRegistrations'] as const) {
         const value = config[key];
         if (value !== undefined && typeof value !== 'boolean') throw new Error(`AlignDriverConfig ${key} must be a boolean`);
     }
     return {
         ...(config.recordPath === undefined ? {} : { recordPath: config.recordPath }),
         ...(config.runAlign === undefined ? {} : { runAlign: config.runAlign }),
+        ...(config.runBaselineProbe === undefined ? {} : { runBaselineProbe: config.runBaselineProbe }),
         ...(config.injectAskUserCall === undefined ? {} : { injectAskUserCall: config.injectAskUserCall }),
         ...(config.snapshotFirstMutation === undefined ? {} : { snapshotFirstMutation: config.snapshotFirstMutation }),
         ...(config.haltAtDecision === undefined ? {} : { haltAtDecision: config.haltAtDecision }),
@@ -228,6 +232,38 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                 }
             }
         }
+        if (resolved.runBaselineProbe === true) {
+            const tools = ctx.get('tools');
+            if (tools === undefined) {
+                record(resolved.recordPath, { phase: 'baseline-probe', executed: false, error: 'no tools service' });
+            } else {
+                try {
+                    const result = await tools.execute({
+                        callId: CallId(`alignment-baseline-probe-${String(agent.session.id)}`),
+                        name: 'establish_baseline',
+                        arguments: {
+                            baseline: {
+                                goal: 'Verify establish_baseline from the packed install',
+                                explicitConstraints: ['packed tarball only']
+                            }
+                        },
+                        agent,
+                        signal: new AbortController().signal
+                    });
+                    const status = statusOf(getStore(), agent);
+                    record(resolved.recordPath, {
+                        phase: 'baseline-probe',
+                        executed: true,
+                        isError: result.isError,
+                        ...(result.isError ? { error: result.error, content: result.content } : {}),
+                        revision: status.revision,
+                        baselineRecorded: status.baseline !== undefined
+                    });
+                } catch (error) {
+                    record(resolved.recordPath, { phase: 'baseline-probe', executed: false, error: String(error) });
+                }
+            }
+        }
         if (resolved.verifyRegistrations === true) {
             try {
                 const tools = ctx.get('tools');
@@ -235,6 +271,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                 const systemPrompt = ctx.get('systemPrompt');
                 const toolNames = (['establish_baseline', 'report_drift'] as const).filter((name) => tools?.get(name) !== undefined);
                 const align = commands?.find(agent, 'align') !== undefined;
+                const alignMode = commands?.find(agent, 'align-mode') !== undefined;
                 let policy = false;
                 if (systemPrompt !== undefined) {
                     const assembly = await systemPrompt.assemble(assembleContextFor(agent));
@@ -245,7 +282,8 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                     executed: true,
                     policy,
                     tools: [...toolNames],
-                    align
+                    align,
+                    alignMode
                 });
             } catch (error) {
                 record(resolved.recordPath, { phase: 'registrations', executed: false, error: String(error) });

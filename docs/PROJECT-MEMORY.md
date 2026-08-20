@@ -70,11 +70,12 @@ correctness suite on purpose (`-Benchmark05`).
 
 The headless app is one-shot (`--help` only). Interruption-durability
 verification (cases 11, 12) halts the process via the driver and re-folds the
-PERSISTED session log with `scripts/fold-session.mjs` (zstd frames +
-chunk-run expansion via `decodeStorageRecord`); the post-resume
-`establish_baseline` is simulated on the same log. The fold result — and, for
-case 12, the projected baseline summary a resumed session would see — is what
-resume would reconstruct.
+PERSISTED sidecar (`storages/requirements_alignment.json`) with
+`scripts/fold-session.mjs`; the post-resume `establish_baseline` is simulated
+on the same sidecar record. The fold result — and, for case 12, the projected
+baseline summary a resumed session would see — is what resume would
+reconstruct. The script falls back to the legacy session-log fold only when
+the sidecar has no record for that session.
 
 ## 6. Packaging notes
 
