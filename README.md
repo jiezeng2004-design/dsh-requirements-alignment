@@ -61,17 +61,18 @@ Use `/align` any time you want to inspect whether the current execution still ma
 
 ## Choose how alignment runs
 
-Alignment mode is a **three-layer model** that can change at runtime without a profile restart:
+Alignment mode is a **four-layer model** that can change at runtime without a profile restart:
 
 ```text
-valid persisted override  ->  valid profile default  ->  auto
+valid session override  ->  valid persisted runtime override  ->  valid profile default  ->  auto
 ```
 
 | Layer | Source | Persisted where |
 |---|---|---|
+| **Session Override** (`sessionMode`) | Your per-session switching (`/align-mode session`). Only the calling session is affected. | The durable `requirements_alignment_modes` sidecar (official `storage-domain` → `storage-json`), keyed by session lifecycle identity |
 | **Profile Default** (`defaultMode`) | The composition/profile config — `mode: auto|manual|off` in the profile bundle (`cordis.patch.yml`), default `auto` when absent. | Profile composition |
 | **Runtime Override** (`overrideMode`) | Your runtime switching (`setMode` / the settings document). | `settings.yaml` via the DSH Settings service (`@deepseek-ai/dsh-settings`) |
-| **Effective Mode** | `effectiveMode = valid override ?? valid default ?? auto`; **Effective Source** reports which layer produced it (`override` / `profile`). | derived |
+| **Effective Mode** | `effectiveMode = valid session override ?? valid runtime override ?? valid profile default ?? auto`; **Effective Source** reports which layer produced it (`session` / `override` / `profile`). | derived |
 
 ```yaml
 - id: requirements-alignment
@@ -80,13 +81,15 @@ valid persisted override  ->  valid profile default  ->  auto
     mode: auto          # profile default; a runtime override wins over this
 ```
 
-- **Profile Default** — the composition layer. It is the fallback when no override exists. Changing it (or the override) never rewrites the other; switching modes never edits the profile YAML.
-- **Runtime Override** — switching Auto → Manual → Off at runtime is persisted through the DSH Settings service, so a DSH restart restores `effective = your last override`. An invalid persisted value (for example a hand-edited `mode: banana`) never fails startup: the plugin falls back to the profile default and repairs the document once.
-- **Reset to Profile Default** — resetting (a `resetMode` call or replacing the settings section with `{}`) drops the override. `effective = defaultMode`, source = `profile`. It never re-writes the current effective mode as a new override.
+- **Session Override** — switching Auto → Manual → Off for ONE session via `/align-mode session`. Only the calling session's effective mode changes; other live sessions and the shared runtime override never move. Persisted per session (keyed by `id + createdAt + cwd`), so a resumed session restores its override, and a fork inherits the effective session override at its seed boundary (then becomes independently changeable). An invalid persisted value fails open to the next valid layer.
+- **Profile Default** — the composition layer. It is the fallback when no session or runtime override exists. Changing it (or either override) never rewrites the others; switching modes never edits the profile YAML.
+- **Runtime Override** — switching Auto → Manual → Off at runtime is persisted through the DSH Settings service, so a DSH restart restores `effective = your last runtime override`. An invalid persisted value (for example a hand-edited `mode: banana`) never fails startup: the plugin falls back to the profile default and repairs the document once.
+- **Reset to Profile Default** — resetting (a `resetMode` call or replacing the settings section with `{}`) drops the runtime override. `effective = defaultMode`, source = `profile`. It never re-writes the current effective mode as a new override.
+- **Web floating capsule (v0.4.1)** — in DSH Web, a bottom-right collapsible capsule shows the current session's effective mode as a colored dot + label. Expanding it manages the two layers you control: the **session layer** (toggles the current session's override only) and the **shared layer** (the runtime override every session falls back to). Everything goes through the loopback management API, so the capsule and `/align-mode` always agree.
 
-**Hot switching** — mode transitions are real register/dispose operations (`AlignmentRuntime`), not a "change the config and restart" step. Auto → Manual → Off → Auto can be cycled live with no duplicates, no listener leaks, and no profile restart. (`/align`, `establish_baseline`, `report_drift`, and `/align-migrate` are registered or disposed with the mode.) `/align-mode` is the always-on control command: Off unregisters alignment capabilities but keeps `/align-mode` so you can switch back.
+**Hot switching** — mode transitions are per-agent register/dispose operations on the agent's OWN scope (`agent.ctx`), not a "change the config and restart" step. When a session's effective mode changes, that session's agent is re-synced: the outgoing capability set is disposed and the incoming one registered in the agent's scope. Two live sessions hold disjoint capability sets with zero leakage. Auto → Manual → Off → Auto can be cycled live with no duplicates, no listener leaks, and no profile restart. `/align-mode` is the always-on control command: an Off session has no alignment capabilities at all (no policy, no tools, no `/align`) but keeps `/align-mode` so it can switch itself back.
 
-> **Runtime Mode backend: implemented.** **Native Web Settings UI: not implemented** (that would need a DSH Core patch). The user-facing switch in this release is `/align-mode`; the runtime override is also persisted through the official DSH Settings service (`@deepseek-ai/dsh-settings`), and an external `settings.yaml` hot edit is picked up live. The profile default remains `mode:` in the profile bundle.
+> **Runtime Mode backend: implemented.** **Web floating capsule: implemented** (v0.4.1). The capsule — a bottom-right collapsible float in the DSH Web `shell.overlay` slot — switches the session and shared layers via the plugin's loopback management API, so it can never disagree with `/align-mode`. The runtime override is also persisted through the official DSH Settings service (`@deepseek-ai/dsh-settings`), and an external `settings.yaml` hot edit is picked up live. The profile default remains `mode:` in the profile bundle.
 
 **Auto is the recommended default.** Clear tasks run with zero interruption; you are only asked when the execution is about to change direction.
 
@@ -96,17 +99,34 @@ valid persisted override  ->  valid profile default  ->  auto
 | **Manual** | no | yes | yes | yes |
 | **Off** | no | no | no | yes |
 
-- **Auto** — the drift-guard policy is in every agent's system prompt. The agent records a light baseline when the request carries protected scope, stays silent otherwise, and calls `report_drift` only for a real direction change.
+Every cell above describes ONE session's effective mode. Since v0.4.0 the capabilities are registered in that session's agent scope (`agent.ctx`), so two live sessions can hold different effective modes at the same time — the matrix applies per session, never globally.
+
+- **Auto** — the drift-guard policy is in this session's system prompt. The agent records a light baseline when the request carries protected scope, stays silent otherwise, and calls `report_drift` only for a real direction change.
 - **Manual** — no automatic policy. The agent works normally until you run `/align`, which reports status and steers a fresh inspection.
-- **Off** — the plugin stays installed but unregisters alignment capabilities: no policy, no alignment tools, no `/align`. `/align-mode` stays so you can switch back to Auto or Manual without editing the profile or `settings.yaml`.
+- **Off** — this session has NO alignment capabilities: no policy, no alignment tools, no `/align`. `/align-mode` (registered at plugin scope) stays so you can switch this session back to Auto or Manual without editing the profile or `settings.yaml`.
+
+### Session-scoped mode (v0.4.0)
+
+`/align-mode` operates on the **shared** layers (runtime override + profile default); `/align-mode session` operates on **only the current session**:
+
+```
+/align-mode                  # this session's four-layer snapshot
+/align-mode session          # same four-layer snapshot
+/align-mode session auto|manual|off   # set ONLY this session's override
+/align-mode session reset    # drop this session's override -> shared layers
+/align-mode auto|manual|off  # shared runtime override (all sessions fall back to it)
+/align-mode reset            # drop the shared runtime override -> profile default
+```
+
+`/align-mode session` is explicit so you cannot accidentally change every session while intending to change only the current one. Two concurrent sessions can hold different effective modes with zero leakage; changing Session A never changes Session B or the shared runtime override. A resumed session restores its override, and a fork inherits the effective session override at its seed boundary (then becomes independently changeable). The four-layer snapshot identifies the exact source of the current session's effective mode (`session override` / `runtime override` / `profile default`).
 
 ### State is never lost by switching modes
 
-Canonical alignment state (baselines, drifts, decisions, manual checks) lives in the **independent** `AlignmentStateStore` sidecar. Switching Auto → Manual → Off → Auto only changes which runtime capabilities are registered; it never deletes a baseline, never deletes the sidecar, never clears state, and never rewrites session events. A baseline established in Auto is still there after Off and back.
+Canonical alignment state (baselines, drifts, decisions, manual checks) lives in the **independent** `AlignmentStateStore` sidecar, and session-mode overrides live in the separate `requirements_alignment_modes` sidecar. Switching Auto → Manual → Off → Auto (shared or per session) only changes which capabilities are registered in that session's agent scope; it never deletes a baseline, never deletes either sidecar, never clears state, and never rewrites session events. A baseline established in Auto is still there after Off and back, and a session override is never touched by a shared reset.
 
 ### Off ≠ Uninstall
 
-`mode: off` (as profile default or as a runtime override) leaves the bundle in the profile. The row is still loaded, no alignment tools or policy are registered, and you can switch back to Auto or Manual live. That is not the same as uninstalling. (A session that predates the persistence-compatibility fix may still carry legacy `alignment/*` events in its log; current production never appends them.)
+`mode: off` (as profile default, a runtime override, or a session override) leaves the bundle in the profile. The row is still loaded; an Off session has no alignment capabilities, and `/align-mode session auto|manual|off` can switch it back live. That is not the same as uninstalling. (A session that predates the persistence-compatibility fix may still carry legacy `alignment/*` events in its log; current production never appends them.)
 
 ```yaml
 # disable the controller only (leaves the ask-user tool mounted)
@@ -120,7 +140,7 @@ Canonical alignment state (baselines, drifts, decisions, manual checks) lives in
 dsh plugin --profile web rm dsh-requirements-alignment
 ```
 
-Every registration is a Cordis effect disposer owned by the plugin's fiber: unloading removes the policy section, the `/align` + `/align-migrate` + `/align-mode` commands, and both tools. Canonical alignment state remains in the durable sidecar. Only sessions written by older versions keep legacy `alignment/*` events in their log — the current plugin never appends them to live sessions.
+Every registration is a Cordis effect disposer: unloading removes the plugin-scope `/align-mode` and explicitly unwinds every per-agent capability set (policy section, `/align` + `/align-migrate`, both tools). Canonical alignment state remains in the durable sidecars. Only sessions written by older versions keep legacy `alignment/*` events in their log — the current plugin never appends them to live sessions.
 
 ## Auto mode (default)
 
@@ -236,8 +256,8 @@ Unknown config keys fail at load (same stance as `dsh-plan-mode`).
 - **Subagents cannot ask the user.** They report drift candidates to the parent, which owns the interaction.
 - **Baseline content is model-produced.** The fold is deterministic; what the model records as the baseline is the model's reading of the task. Keep prompts explicit when the direction matters.
 - **Sidecar grows append-only.** Every baseline, drift, decision, and manual check appends a whole-state checkpoint; there is no pruning yet. Very long sessions with many `/align` runs accumulate checkpoints (reads stay `O(1)` at the head, storage grows with the mutation count).
-- **No Web status projection.** Alignment status is surfaced through `/align` text and the per-session policy summary; there is no client-side status card or projection yet.
-- **No session-scoped mode in v0.3.0.** `/align-mode` changes the shared plugin/Profile runtime override, not only the calling session. A session-scoped selector is planned for v0.4.0 in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+- **Capsule state is polled, not pushed.** The floating capsule polls the loopback management API every 2s while the page is visible; a mode change applied from another tab or by `settings.yaml` hot edit may take up to one poll cycle (~2s) to appear. Full baseline history is still inspected through `/align` text; the capsule shows the latest snapshot only.
+- **The capsule rides the `shell.overlay` slot and the webServer service.** If the web profile is not running, or the `shell.overlay` slot is unavailable, the capsule simply does not mount and `/align-mode` remains the control surface.
 
 ## Testing and verification
 
@@ -252,11 +272,11 @@ Real DSH dogfooding boots real `dsh` profiles with an isolated `DSH_HOME`. Three
 ```powershell
 powershell -File scripts/dogfood.ps1 -Smoke        # development: 02-typo, 03-bugfix, 04-scope-drift, 09-drift-choice
 powershell -File scripts/dogfood.ps1 -Scenario 12-interrupt-revise   # one scenario
-powershell -File scripts/dogfood.ps1               # FULL correctness suite (RC gate): 01..12 minus the 05 benchmark
+powershell -File scripts/dogfood.ps1               # FULL correctness suite (RC gate): 01..13 minus the 05 benchmark
 powershell -File scripts/dogfood.ps1 -Benchmark05  # natural benchmark: 3 runs, reports NATURAL DRIFT TRIGGER N/M
 ```
 
-`-FailFast` aborts at the first failed check; `-TimeoutSec <n>` (default 600) is a hard per-scenario timeout that kills the process tree. Scenario tasks for natural-behavior cases (03, 04, 05) contain NO protocol instructions; protocol-forced mechanism cases (01, 06, 07, 08, 09, 10, 11, 12) are reported separately — the natural drift trigger rate is its own metric, never presented as a mechanism verification. The full suite must run under `danger-full-access` (see `docs/PROJECT-MEMORY.md`).
+`-FailFast` aborts at the first failed check; `-TimeoutSec <n>` (default 600) is a hard per-scenario timeout that kills the process tree. Scenario tasks for natural-behavior cases (03, 04, 05) contain NO protocol instructions; protocol-forced mechanism cases (01, 06, 07, 08, 09, 10, 11, 12, 13) are reported separately — the natural drift trigger rate is its own metric, never presented as a mechanism verification. Scenario 13 (session-scoped mode) exercises the two-session isolation probe (`switchTopLevelOnSubagent`). The full suite must run under `danger-full-access` (see `docs/PROJECT-MEMORY.md`).
 
 The packed-artifact smoke packs the current tarball, installs it into a disposable profile, boots Auto → Manual → Off (`/align`, `establish_baseline`, and the policy section are asserted from the assembled system prompt and live registries — not a loose word match), removes it, and verifies the profile restores cleanly:
 
@@ -279,7 +299,7 @@ The v0.2.2 persistence-compatibility gate verified:
 - Align-driver regression: `apply()` before the controller exists → later reads resolve the sidecar (revision 1), never the legacy fold
 - Real dogfood 01-greenfield / 02-typo / 03-bugfix: **PASS** (03 asserts `baseline recorded` + `revision >= 1`)
 - `npm pack --dry-run` passes (exports targets all present; no v0.3.0 runtime-mode / hot-switch files)
-- DSH rc.6: `KNOWN_SESSION_EVENT_TYPES` = **44**, `alignment/*` = **0** official known event types
+- DSH rc.6 at the time: `KNOWN_SESSION_EVENT_TYPES` = **44** official known event types; `alignment/*` = **0** official known event types. The invariant is *semantic*: the registry intersects with the upstream known set and never contains `alignment/*` types — the fixed count is informational, not contractual.
 
 The v0.3.0 runtime-mode / hot-switching gate verified:
 
@@ -291,6 +311,67 @@ The v0.3.0 runtime-mode / hot-switching gate verified:
 - Rollback: transition failure restores the prior mode; a settings persistence failure compensates the runtime back (no split-brain)
 - Persistence regression suite (cold resume, fork, historical fork, compaction, legacy migration): **PASS** — production writer still emits **zero** `alignment/*` events
 - Current-tarball packed add/boot/remove: **40/40** — clean profile with no source link; Auto / Manual / Off registries, `/align`, `/align-mode`, direct `establish_baseline`, uninstall, and manifest restoration verified. External model completion was unavailable (`QUOTA: Insufficient Balance`) and is reported separately rather than claimed as an E2E pass.
+
+The v0.4.0 session-scoped-mode gate verified:
+
+- Core modifications: **0**
+- Node tests: **188/188 passing** (v0.3.0 suite rewritten for the per-agent capability model plus new `session-mode` and `session-mode-store` suites: four-layer resolution, two-session isolation, `/align-mode session`, fork inheritance, durable sidecar, identity binding, per-agent registration failure rollback)
+- Per-agent capability matrix (unit): Auto registers policy + tools + `/align` + `/align-migrate` in the agent's own scope; Manual keeps tools + commands; Off registers nothing (only the plugin-scope `/align-mode` survives). Two live sessions hold disjoint capability sets with zero leakage.
+- Shared-layer changes resync only agents without a session override; a session override pins that session against the shared layer.
+- Session override durability: `setOverride`/`clearOverride` are durable-first (failed writes never commit); identity binding prevents id-reuse leakage; fork children inherit the parent override once and become independent.
+- Dogfood scenario 13 (real boot, driver-confirmed pre-model): the top-level agent registers its full **auto** capability set in its own scope. The subagent/top-switch assertions require a live external model and could not run (`QUOTA: Insufficient Balance`) — reported separately, never claimed as a mechanism pass.
+- Packed add/install/compose against the current 0.4.0 tarball: **PASS**; Auto/Manual/Off boot verification is blocked by the same external `QUOTA`.
+
+The v0.4.1 Web capsule + DSH rc.1 compatibility gate verified:
+
+- Core modifications: **0** (no `@deepseek-ai/*` change; no DSH Core patch).
+- Node tests: **228/228 passing** — the full suite on the rc.1 dependency family
+  (re-verified this round; +A–D capability rollback +E–H stale-session race,
+  + the A–G mode-source/capability transaction matrix).
+- Mode source / active capability atomicity (P0, this round): a mode change is
+  considered COMMITTED only after BOTH the persisted source and the live agent
+  capabilities converge; a failed capability transition compensates the source
+  back (presence-preserving for session overrides), and the mutation reports
+  failure — `/align-mode` and the management API never claim the target is
+  active. The only advertised non-converged states are the explicit
+  capability-degraded and pending source-compensation ones (both exposed on the
+  status payload with the ACTUAL active capability mode).
+- DSH baseline upgraded to **`0.1.1-rc.1`** exactly; `KNOWN_SESSION_EVENT_TYPES`
+  is the official rc.1 semantic set (`alignment/*` types are never runtime-
+  registered — the invariant is *intersection with the official known set*, not a
+  hand-maintained count).
+- Real-rc.1 migration parity: real rc.1 writer fixtures (full official
+  vocabulary + five legacy alignment events; a fork child with
+  `parentSession`/`seedLength`) migrate and reload through the real rc.1 reader
+  with seq continuity, header, packed chunk rows, resume end-seed, and fork
+  lineage preserved. Only whitelisted legacy events become `ignorable`;
+  everything else is byte-preserved.
+- Packed-artifact smoke against a real `0.1.1-rc.1` DSH installation: the
+  tarball installs via the real `dsh plugin` command (bundle reconciled),
+  `--dump-config` composes the plugin's two rows, a real headless boot mounts
+  the plugin service and the full capability matrix is verified live — policy
+  section in the assembled prompt, `establish_baseline` + `report_drift`
+  tools, `/align` + `/align-mode` from the real registries. `/align-mode`
+  persistence fails *loud* on the entry-only port when storage-domain is absent
+  (verifies the no-silent-live-only contract); removing the bundle leaves no
+  leftover rows. External model completion was unavailable (`QUOTA`) and is
+  reported separately, never claimed as a model E2E pass.
+- Client slot contract fix: the capsule's `shell.overlay` registration no longer
+  uses a function-valued label; the render test asserts exactly one accepted
+  registration.
+- Capability transition rollback atomicity (P0, this round): the controller no
+  longer reuses an executed (disposed) registration record on a failed
+  transition — it RE-REGISTERS the previous mode with fresh disposers, and a
+  double failure fails loud into an explicit degraded pending-reconciliation
+  state. Verified in unit tests A–D.
+- Stale-session Web Capsule race (P1, this round): the capsule now uses a
+  request-generation token + session ref, so an out-of-order (or
+  session→no-session) response can never overwrite the current session's
+  snapshot, session mutations always target the current session, and no
+  `?sessionId=undefined` request can ever be built. Verified in unit tests E–H
+  against the production bundle with a real hooks/effects renderer, and the
+  rebuilt bundle + loopback management API guard contract were verified live
+  against the running DSH Web `0.1.1-rc.1`.
 
 Detailed evidence and the bounded-run caveat are recorded in `ACCEPTANCE.md`.
 
@@ -320,8 +401,11 @@ See `docs/ARCHITECTURE.md` for the design decisions and the exact capability sea
 
 ## Compatibility
 
-- DeepSeek Harness `0.1.0-rc.6` (verified against the local profile bundle set and the npm registry releases of the same version).
-- `@deepseek-ai/cordis` 4.x, `@deepseek-ai/dsh-*` `^0.1.0-rc.6`.
+- DeepSeek Harness `0.1.1-rc.1` (verified against the npm registry releases and
+  a real rc.1 DSH installation through the packed-artifact add/boot/remove
+  smoke; migration parity is byte-for-byte with the rc.1 writer/reader).
+- `@deepseek-ai/cordis` 4.x, `@deepseek-ai/dsh-*` `0.1.1-rc.1` (exact pins, no
+  prerelease range drift).
 - Windows (verified) and POSIX (no platform-specific code).
 - Old v0.1 sessions fold safely: legacy `alignment/status` events still count as manual checks, and a session without the new events simply reports revision 0 / "unknown" instead of crashing.
 

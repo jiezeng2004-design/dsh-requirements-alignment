@@ -1,6 +1,7 @@
 node_modules/
 lib/
 *.tsbuildinfo
+.client-build
 .pnpm-store/
 dogfood/records/
 dogfood/logs/

@@ -117,13 +117,31 @@ function Get-Note([object]$Row, [string]$Name) {
     return $prop.Value
 }
 
+function Reset-ModeState {
+    param([Parameter(Mandatory)][string]$SettingsPath)
+    # The shared runtime override persists in the DSH_HOME settings.yaml
+    # (fourth mode layer); remove the requirements-alignment row so every
+    # packed boot starts from ONLY its overlay profile-default mode.
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return }
+    $raw = [IO.File]::ReadAllText($SettingsPath)
+    if ($raw -notmatch '(?m)^requirements-alignment:') { return }
+    $newRaw = [regex]::Replace($raw, '(?m)^requirements-alignment:[^
+]*(?:?
+[ 	][^
+]*)*?
+?', '')
+    [IO.File]::WriteAllText($SettingsPath, $newRaw, $utf8NoBom)
+    Write-Host "reset persisted shared-mode rows in $SettingsPath"
+}
+
 function Invoke-ModeBoot {
     param(
         [Parameter(Mandatory)][string]$Mode,
         [Parameter(Mandatory)][string]$TarballName,
         [Parameter(Mandatory)][bool]$ExpectPolicy,
         [Parameter(Mandatory)][bool]$ExpectTools,
-        [Parameter(Mandatory)][bool]$ExpectAlign
+        [Parameter(Mandatory)][bool]$ExpectAlign,
+        [string]$SwitchTo = ''
     )
     $scenarioName = "$profile-$Mode"
     $scenarioDir = Join-Path $pluginRoot "dogfood\scenarios\$scenarioName"
@@ -138,6 +156,7 @@ function Invoke-ModeBoot {
     $yamlRecordPath = $recordPath.Replace("'", "''")
     $runAlign = if ($ExpectAlign) { 'true' } else { 'false' }
     $runBaselineProbe = if ($ExpectTools) { 'true' } else { 'false' }
+    $switchLine = if ($SwitchTo) { "        switchSharedModeTo: '$SwitchTo'" } else { '' }
     $overlay = @"
 - id: requirements-alignment
   config:
@@ -156,6 +175,7 @@ function Invoke-ModeBoot {
         runBaselineProbe: $runBaselineProbe
         verifyPolicySection: true
         verifyRegistrations: true
+$switchLine
 "@
     $overlayPath = Join-Path $tempRoot "packed-smoke-$Mode-overlay.yml"
     [IO.File]::WriteAllText($overlayPath, $overlay, $utf8NoBom)
@@ -215,6 +235,39 @@ function Invoke-ModeBoot {
         Add-Check (($null -ne $policy) -and ("$(Get-Note $policy 'textHead')" -match '## Requirements Alignment policy')) "$Mode policy section text is the shipped drift-guard policy"
     } else {
         Add-Check (($null -ne $policy) -and [bool](Get-Note $policy 'executed') -and -not [bool](Get-Note $policy 'present')) "$Mode assembled system prompt has no requirements-alignment:policy section"
+    }
+    # v0.4.1 mode-switch probe: boot in $Mode, run the REAL /align-mode command
+    # to switch the shared layer to $SwitchTo, and verify the capability matrix
+    # after the switch (transactional commitment: source AND live capabilities
+    # converge, effective mode matches).
+    if ($SwitchTo) {
+        $before = Get-FirstPhase $records 'switch-before'
+        $sw = Get-FirstPhase $records 'mode-switch'
+        $after = Get-FirstPhase $records 'switch-after'
+        Add-Check (($null -ne $before) -and [bool](Get-Note $before 'executed')) "$Mode switch-before registrations recorded"
+        Add-Check (($null -ne $sw) -and [bool](Get-Note $sw 'executed') -and ((Get-Note $sw 'resultKind') -eq 'success')) "$Mode /align-mode $SwitchTo executed through the real commands registry"
+        $switchLabel = switch ($SwitchTo) { 'auto' { 'Auto' } 'manual' { 'Manual' } 'off' { 'Off' } }
+        Add-Check (($null -ne $sw) -and ("$(Get-Note $sw 'resultText')" -match [regex]::Escape("Switched to $switchLabel"))) "$Mode /align-mode result claims the switch to $switchLabel"
+        $afterOk = ($null -ne $after) -and [bool](Get-Note $after 'executed')
+        Add-Check $afterOk "$Mode switch-after registrations recorded"
+        if ($afterOk) {
+            $expPolicyAfter = ($SwitchTo -eq 'auto')
+            $expToolsAfter = ($SwitchTo -ne 'off')
+            $expAlignAfter = ($SwitchTo -ne 'off')
+            $afterTools = @()
+            $afterToolsValue = Get-Note $after 'tools'
+            if ($null -ne $afterToolsValue) { $afterTools = @($afterToolsValue) }
+            Add-Check ([bool](Get-Note $after 'policy') -eq $expPolicyAfter) "$Mode after switch to $SwitchTo policy present=$expPolicyAfter (got $(Get-Note $after 'policy'))"
+            Add-Check (((($afterTools -contains 'establish_baseline') -and ($afterTools -contains 'report_drift')) -eq $expToolsAfter)) "$Mode after switch to $SwitchTo alignment tools present=$expToolsAfter (got: $($afterTools -join ','))"
+            Add-Check ([bool](Get-Note $after 'align') -eq $expAlignAfter) "$Mode after switch to $SwitchTo /align registered=$expAlignAfter (got $(Get-Note $after 'align'))"
+            $afterEffective = "$(Get-Note $after 'effective')"
+            Add-Check ($afterEffective -match [regex]::Escape("$SwitchTo/")) "$Mode after switch to $SwitchTo effective mode is $SwitchTo (got $afterEffective)"
+        } else {
+            Add-Check $false "$Mode after switch to $SwitchTo policy present"
+            Add-Check $false "$Mode after switch to $SwitchTo alignment tools present"
+            Add-Check $false "$Mode after switch to $SwitchTo /align registered"
+            Add-Check $false "$Mode after switch to $SwitchTo effective mode is $SwitchTo"
+        }
     }
 }
 
@@ -292,6 +345,20 @@ Push-Location $dstProfile
 $installExit = $LASTEXITCODE
 Pop-Location
 Add-Check ($installExit -eq 0) 'disposable profile installed offline from the shared store'
+# rc.1 runtime guard: the disposable profile must resolve the SAME 0.1.1-rc.1
+# DSH family the plugin pins (no range drift, no stale rc.x runtime).
+$runtimeChecks = @(
+    @{ Name = 'dsh-headless'; Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-headless\package.json' },
+    @{ Name = 'dsh-commands'; Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-commands\package.json' },
+    @{ Name = 'dsh-base';     Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-base\package.json' }
+)
+foreach ($rc in $runtimeChecks) {
+    $rcVer = ''
+    if (Test-Path -LiteralPath $rc.Path) {
+        $rcVer = [string](Get-Content -LiteralPath $rc.Path -Raw | ConvertFrom-Json).version
+    }
+    Add-Check ($rcVer -eq '0.1.1-rc.1') "disposable $($rc.Name) runtime is 0.1.1-rc.1 (got: $(if ($rcVer) { $rcVer } else { 'missing' }))"
+}
 $preexistingInstall = Join-Path $dstProfile 'node_modules\dsh-requirements-alignment'
 Add-Check (-not (Test-Path -LiteralPath $preexistingInstall)) 'disposable profile starts without a workspace-linked plugin'
 
@@ -319,10 +386,20 @@ Add-Check (-not $pointsAtSource) "installed package is isolated from the source 
 $dump = & $script:dsh --profile $profile --dump-config 2>&1 | Out-String
 Add-Check ($dump -match 'requirements-alignment' -and $dump -match 'requirements-alignment-ask-user') 'composed profile contains both plugin rows'
 
-# ---------------------------------------------- 5. Auto → Manual → Off
-Invoke-ModeBoot -Mode 'auto' -TarballName $tarball.Name -ExpectPolicy $true -ExpectTools $true -ExpectAlign $true
-Invoke-ModeBoot -Mode 'manual' -TarballName $tarball.Name -ExpectPolicy $false -ExpectTools $true -ExpectAlign $true
+# ---------------------------------------------- Off → Auto → Manual
+# Each boot starts from ONLY its overlay profile-default mode (the shared
+# runtime override persists in the DSH_HOME settings layer between boots, so
+# the persisted mode is reset before every boot). The OFF boot runs FIRST,
+# before any switch can persist an override, keeping it fully deterministic.
+Reset-ModeState (Join-Path $dshHome 'settings.yaml')
 Invoke-ModeBoot -Mode 'off' -TarballName $tarball.Name -ExpectPolicy $false -ExpectTools $false -ExpectAlign $false
+# B (v0.4.1): boot Auto, switch the shared layer to Manual through the REAL
+# /align-mode command, verify the effective mode + capability matrix follow.
+Reset-ModeState (Join-Path $dshHome 'settings.yaml')
+Invoke-ModeBoot -Mode 'auto' -TarballName $tarball.Name -ExpectPolicy $true -ExpectTools $true -ExpectAlign $true -SwitchTo 'manual'
+# A (v0.4.1): boot Manual, switch to Auto, verify the full auto matrix lands.
+Reset-ModeState (Join-Path $dshHome 'settings.yaml')
+Invoke-ModeBoot -Mode 'manual' -TarballName $tarball.Name -ExpectPolicy $false -ExpectTools $true -ExpectAlign $true -SwitchTo 'auto'
 
 # ---------------------------------------------- 6. remove and verify restore
 & $script:dsh plugin --profile $profile rm dsh-requirements-alignment

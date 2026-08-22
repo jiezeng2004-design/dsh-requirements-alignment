@@ -29,7 +29,7 @@ import { apply as storageDomainApply } from '@deepseek-ai/dsh-storage-domain';
 import { RequirementsAlignmentController } from '../src/index.ts';
 import { compressZstdFrame, migrateLegacyArtifact, parseArtifactText, scanZstdFrames } from '../src/migration.ts';
 import { foldAlignmentStatus } from '../src/status.ts';
-import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
+import type { SessionEvent, SessionEventType } from '@deepseek-ai/dsh-session/types';
 
 const CWD = join(tmpdir(), 'dsh-alignment-migration-workspace');
 
@@ -443,6 +443,307 @@ test('migration: a second run is an idempotent no-op and leaves the artifact byt
     }
 });
 
+// ── real rc.1 writer parity: the fixture is produced by the REAL backend ────
+
+/**
+ * Build a real DSH `0.1.1-rc.1` writer-produced artifact for a session with
+ * the FULL modern vocabulary — header, user/message, assistant/chunk (which
+ * packs into `text-chunks`/`tool-call-chunks` rows on materialization),
+ * assistant/message, tool call + result, and `turn/start`/`turn/end` — plus
+ * the legacy `alignment/*` events appended through the SAME real
+ * `Session.append` (the rc.1 writer accepts unknown event types). This is
+ * byte-truthful: the artifact on disk is produced by the real backend we
+ * ship against, so the migration parity gate exercises exactly the physical
+ * format rc.1 writes, not a local mirror.
+ */
+async function writeRealWriterArtifact(root: string, id: string): Promise<{ session: Session; ctx: Context }> {
+    const ctx = new Context();
+    ctx.plugin(SessionStore);
+    await ctx.plugin(JsonlSessionPersistence, { root, packChunks: true });
+    const session = ctx.sessions.create(SessionId(id), {
+        meta: { cwd: CWD, delegationDepth: 2, agentPreset: 'codex' }
+    });
+
+    // A fresh (non-seeded) session: the constructor writes NO end-seed marker.
+    // Turn 1: user message, assistant chunks (packed), assistant message,
+    // tool call + result, with realistic rc.1 message shapes.
+    appendReal(session, 'turn/start', { turn: 1 });
+    appendReal(session, 'user/message', {
+        id: 'm-1',
+        role: 'user',
+        content: [{ type: 'text', text: 'request 1' }],
+        source: { kind: 'user' }
+    }, { surfaceOp: 'append' });
+    appendReal(session, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'A' } });
+    appendReal(session, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'B' } });
+    appendReal(session, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'C' } });
+    appendReal(session, 'assistant/message', {
+        turn: 1, step: 1,
+        message: {
+            id: 'a-1', role: 'assistant',
+            content: [{ type: 'text', text: 'ABC' }],
+            source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }
+        },
+        usage: { inputTokens: 10, outputTokens: 3 },
+    }, { surfaceOp: 'append', sourceEventSeqs: [2, 3, 4] });
+    appendReal(session, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'tool-call-delta', index: 1, id: 'call-1', name: 'fs_read', argumentsDelta: '{"path"' } });
+    appendReal(session, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'tool-call-delta', index: 1, id: 'call-1', name: 'fs_read', argumentsDelta: ':"/tmp/x"}' } });
+    appendReal(session, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'tool-call-delta', index: 1, id: 'call-1', name: 'fs_read', argumentsDelta: '}' } });
+    appendReal(session, 'tool/call', { turn: 1, step: 1, callId: 'call-1', name: 'fs_read', arguments: '{"path":"/tmp/x"}' });
+    appendReal(session, 'tool/result', {
+        turn: 1, step: 1,
+        message: {
+            id: 'tr-1', role: 'user',
+            content: [{ type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: 'ok' }] }],
+            source: { kind: 'tool', callId: 'call-1' }
+        }
+    }, { surfaceOp: 'append', sourceEventSeqs: [9] });
+    appendReal(session, 'turn/end', { turn: 1, reason: { kind: 'completed' } });
+
+    // The legacy alignment events — the pre-fix writer's private vocabulary,
+    // appended through the very same real writer (rc.1 accepts unknown types;
+    // the reader refuses them until migration marks them ignorable).
+    appendLegacyReal(session, 'alignment/baseline', { baseline: { revision: 1, goal: 'v1', updatedAt: 1700000000100 } });
+    appendLegacyReal(session, 'alignment/drift', { reason: 'scope-expansion', description: 'd1', at: 1700000000200 });
+    appendLegacyReal(session, 'alignment/decision', { driftSeq: 13, decision: 'approve', at: 1700000000300 });
+    appendLegacyReal(session, 'alignment/baseline-updated', { baseline: { revision: 2, goal: 'v2', updatedAt: 1700000000400 } });
+    appendLegacyReal(session, 'alignment/manual-check', { at: 1700000000500 });
+
+    await ctx.sessions.flush(session);
+    return { session, ctx };
+}
+
+/** Append an official (real) event through the real writer. */
+function appendReal(session: Session, type: SessionEventType, data: unknown, opts?: { surfaceOp?: unknown; sourceEventSeqs?: number[] }): void {
+    session.append(type, data as never, opts as never);
+}
+
+/** Append a legacy alignment event through the real writer (unknown type to rc.1). */
+function appendLegacyReal(session: Session, type: string, data: unknown): SessionEvent {
+    return session.append(type as SessionEventType, data as never);
+}
+
+/**
+ * Dispose a standalone cordis Context the same way the sibling harnesses do
+ * (Context has no `.dispose`; its fiber does).
+ */
+async function disposeCtx(ctx: Context): Promise<void> {
+    const fiber = (ctx as unknown as { fiber?: { dispose(): Promise<void> } }).fiber;
+    await fiber?.dispose().catch(() => { });
+}
+
+// ── Test M: real rc.1 writer -> legacy alignment events -> migrate -> real reader loads ──
+
+test('migration M: a REAL rc.1 writer-produced artifact with legacy alignment events migrates and reloads through the REAL rc.1 reader', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-real-'));
+    const storagesRoot = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-real-store-'));
+    try {
+        // Phase 1: the real rc.1 writer produces the artifact (with legacy
+        // alignment events inside — the pre-fix scenario).
+        const writer = await writeRealWriterArtifact(root, 's-real');
+        try {
+            // 17 events total: 12 official + 5 legacy, seq 0..16.
+            assert.equal(writer.session.seq, 17, '12 official + 5 legacy events');
+            // The real writer packed the assistant chunk runs into storage rows.
+            const rawPacked = await writer.ctx.sessionPersistence.readRaw(SessionId('s-real'));
+            assert.ok(rawPacked, 'artifact materialized by the real writer');
+            assert.match(rawPacked!.content, /text-chunks/, 'text-delta run must pack into a text-chunks row');
+            assert.match(rawPacked!.content, /tool-call-chunks/, 'tool-call-delta run must pack into a tool-call-chunks row');
+        } finally {
+            await disposeCtx(writer.ctx);
+        }
+
+        // Phase 2: a bare real reader refuses the artifact (the bug).
+        const bare0 = await bareReader(root);
+        try {
+            await assert.rejects(
+                bare0.ctx.sessionPersistence.load(SessionId('s-real')),
+                /alignment\/baseline/,
+                'the real rc.1 reader must refuse the legacy artifact before migration'
+            );
+        } finally {
+            await bare0.dispose();
+        }
+
+        // Phase 3 + 4: migrate, then prepare + import through the SAME live
+        // harness (it stays alive until ALL of this is done).
+        const harness = await fullHarness(root, storagesRoot);
+        try {
+            const report = await migrateLegacyArtifact(SessionId('s-real'), {
+                persistence: harness.ctx.sessionPersistence,
+                sessions: harness.ctx.sessions
+            });
+            assert.equal(report.migrated, true);
+            assert.equal(report.repairedEvents, 5, 'only the five legacy alignment events gained ignorable');
+            assert.equal(report.header.id, 's-real');
+            assert.equal(report.header.delegationDepth, 2, 'header delegationDepth survived');
+            assert.equal(report.header.agentPreset, 'codex', 'header agentPreset survived');
+            assert.equal(report.originalSha256.length, 64);
+            assert.ok(report.backupPath);
+
+            // The REAL rc.1 reader loads the migrated artifact and the full
+            // event vocabulary is intact (seqs contiguous, header correct,
+            // packed rows readable, import folds correctly).
+            const prepared = await harness.ctx.sessionPersistence.prepare(SessionId('s-real'));
+            try {
+                const session = prepared.session;
+                assert.ok(session, 'migrated artifact prepares through the real reader');
+                assert.equal(session.header.id, 's-real');
+                assert.equal(session.header.delegationDepth, 2);
+                assert.equal(session.header.agentPreset, 'codex');
+                assert.equal(session.events.length, 18, '17 stored + 1 resume end-seed (the whole log is the resume seed)');
+                for (let i = 0; i < session.events.length; i++) {
+                    assert.equal(session.events[i]!.seq, i, `seq ${i} contiguous`);
+                }
+                // All five legacy alignment events are ignorable after migration.
+                const alignmentEvents = session.events.filter((e) => e.type.startsWith('alignment/'));
+                assert.equal(alignmentEvents.length, 5);
+                assert.ok(alignmentEvents.every((e) => e.ignorable === true), 'all five legacy events are ignorable after migration');
+                // The packed rows expanded back into the exact assistant events.
+                const chunks = session.events.filter((e) => e.type === 'assistant/chunk');
+                assert.equal(chunks.length, 6, 'all six raw chunk deltas restored from the packed rows');
+                const firstChunk = chunks[0]!;
+                assert.deepEqual(firstChunk.data.chunk, { type: 'text-delta', index: 0, text: 'A' });
+                const lastTextChunk = chunks[2]!;
+                assert.deepEqual(lastTextChunk.data.chunk, { type: 'text-delta', index: 0, text: 'C' });
+                const toolChunks = chunks.slice(3);
+                assert.equal(toolChunks.length, 3);
+                assert.deepEqual(toolChunks[2]!.data.chunk, { type: 'tool-call-delta', index: 1, id: 'call-1', name: 'fs_read', argumentsDelta: '}' });
+                // The assembled assistant message survived.
+                const assistant = session.events.find((e) => e.type === 'assistant/message')!;
+                assert.deepEqual(assistant.data.message.content, [{ type: 'text', text: 'ABC' }]);
+                // The tool call + result survived.
+                const calls = session.events.filter((e) => e.type === 'tool/call');
+                assert.equal(calls.length, 1);
+                assert.equal((calls[0]!.data as { name: string }).name, 'fs_read');
+                const results = session.events.filter((e) => e.type === 'tool/result');
+                assert.equal(results.length, 1);
+                // Resume semantics: the LAST event is the resume end-seed, written
+                // because the whole stored log becomes the resume seed. firstLiveSeq
+                // points just past the stored log.
+                const endSeeds = session.events.filter((e) => e.type === 'session/end-seed');
+                assert.equal(endSeeds.length, 1, 'a resumed session ends with exactly one end-seed');
+                assert.equal(endSeeds[0]!.seq, 17, 'the resume end-seed sits at the stored-log boundary');
+                assert.equal(session.firstLiveSeq, 17, 'firstLiveSeq = stored log length');
+
+                // Import the legacy timeline into the store (idempotent), and
+                // verify the store state equals the legacy fold.
+                await harness.controller!.stateStore.importLegacyTimeline(session);
+                await harness.controller!.stateStore.importLegacyTimeline(session);
+                const status = harness.controller!.stateStore.getStatus(session);
+                const expected = foldAlignmentStatus(session.events);
+                assert.deepEqual(status, expected, 'imported store state equals the legacy fold');
+                assert.equal(status.baseline?.goal, 'v2');
+                assert.equal(status.revision, 2);
+                assert.equal(status.driftCount, 1);
+                assert.equal(status.lastDrift?.description, 'd1');
+                assert.equal(status.lastDecision?.decision, 'approve');
+                assert.equal(status.manualChecks, 1);
+                assert.equal(status.status, 'aligned');
+            } finally {
+                prepared[Symbol.dispose]();
+            }
+        } finally {
+            await harness.dispose();
+        }
+    } finally {
+        await rm(root, { recursive: true, force: true }).catch(() => { });
+        await rm(storagesRoot, { recursive: true, force: true }).catch(() => { });
+    }
+});
+
+// ── Test N: real rc.1 writer -> fork metadata + session/end-seed survival ───
+
+test('migration N: a real rc.1 fork session (parentSession + seedLength) migrates and resumes with lineage intact', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-fork-'));
+    const storagesRoot = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-fork-store-'));
+    try {
+        // Parent + child via the real writer + real fork.
+        const ctx = new Context();
+        ctx.plugin(SessionStore);
+        await ctx.plugin(JsonlSessionPersistence, { root, packChunks: true });
+        const parent = ctx.sessions.create(SessionId('s-fork-parent'), { meta: { cwd: CWD } });
+        appendReal(parent, 'turn/start', { turn: 1 });
+        appendReal(parent, 'user/message', {
+            id: 'm-fork', role: 'user', content: [{ type: 'text', text: 'fork me' }], source: { kind: 'user' }
+        }, { surfaceOp: 'append' });
+        appendReal(parent, 'turn/end', { turn: 1, reason: { kind: 'completed' } });
+        appendLegacyReal(parent, 'alignment/baseline', { baseline: { revision: 1, goal: 'v1', updatedAt: 1700000000100 } });
+        assert.equal(parent.seq, 4, 'parent: 3 official + 1 legacy (no end-seed for a fresh session)');
+        await ctx.sessions.flush(parent);
+
+        // A real fork: parentSession + seedLength in the child header; the
+        // child's seed (the parent prefix) triggers the constructor end-seed.
+        const child = ctx.sessions.fork(parent, undefined, SessionId('s-fork-child'));
+        appendReal(child, 'turn/start', { turn: 1 });
+        appendReal(child, 'turn/end', { turn: 1, reason: { kind: 'completed' } });
+        assert.equal(String(child.header.parentSession), 's-fork-parent');
+        assert.equal(child.header.seedLength, 4, 'official seedLength = inherited prefix length');
+        assert.equal(child.seq, 7, 'child: 4 inherited + constructor end-seed + 2 live turn events (closed turn)');
+        await ctx.sessions.flush(child);
+        await disposeCtx(ctx);
+
+        // Bare reader refuses both (legacy alignment in parent, inherited in child).
+        const bare0 = await bareReader(root);
+        try {
+            await assert.rejects(bare0.ctx.sessionPersistence.load(SessionId('s-fork-parent')), /alignment\/baseline/);
+            await assert.rejects(bare0.ctx.sessionPersistence.load(SessionId('s-fork-child')), /alignment\/baseline/);
+        } finally {
+            await bare0.dispose();
+        }
+
+        // Migrate BOTH artifacts, then prepare through the real reader.
+        const harness = await fullHarness(root, storagesRoot);
+        try {
+            for (const id of ['s-fork-parent', 's-fork-child']) {
+                const report = await migrateLegacyArtifact(SessionId(id), {
+                    persistence: harness.ctx.sessionPersistence,
+                    sessions: harness.ctx.sessions
+                });
+                assert.equal(report.migrated, true, `${id} migrated`);
+            }
+
+            const parentPrep = await harness.ctx.sessionPersistence.prepare(SessionId('s-fork-parent'));
+            try {
+                const ps = parentPrep.session;
+                assert.equal(ps.header.parentSession, undefined, 'top-level parent has no lineage');
+                assert.equal(ps.events.length, 5, '4 stored + 1 resume end-seed');
+                const legacy = ps.events.filter((e) => e.type === 'alignment/baseline');
+                assert.equal(legacy.length, 1);
+                assert.equal(legacy[0]!.ignorable, true);
+            } finally {
+                parentPrep[Symbol.dispose]();
+            }
+
+            const childPrep = await harness.ctx.sessionPersistence.prepare(SessionId('s-fork-child'));
+            try {
+                const cs = childPrep.session;
+                assert.equal(String(cs.header.parentSession), 's-fork-parent', 'child lineage preserved through migration');
+                assert.equal(cs.header.seedLength, 4, 'child seedLength preserved');
+                assert.equal(cs.events.length, 8, '7 stored + 1 resume end-seed');
+                // The child's STORED history carries the fork constructor's
+                // end-seed exactly at its seed boundary (seq 4); the resume
+                // reads back that marker AND appends its own at the tail.
+                const endSeeds = cs.events.filter((e) => e.type === 'session/end-seed');
+                assert.equal(endSeeds.length, 2, 'the stored fork end-seed AND a resume end-seed');
+                assert.equal(endSeeds[0]!.seq, 4, 'the stored end-seed sits exactly at the seed boundary');
+                assert.equal(endSeeds[1]!.seq, 7, 'the resume end-seed sits at the stored-log boundary');
+                assert.equal(cs.firstLiveSeq, 7, 'firstLiveSeq = stored log length');
+                // The inherited legacy event is ignorable after migration.
+                const inheritedLegacy = cs.events.find((e) => e.type === 'alignment/baseline')!;
+                assert.equal(inheritedLegacy.seq, 3);
+                assert.equal(inheritedLegacy.ignorable, true);
+            } finally {
+                childPrep[Symbol.dispose]();
+            }
+        } finally {
+            await harness.dispose();
+        }
+    } finally {
+        await rm(root, { recursive: true, force: true }).catch(() => { });
+        await rm(storagesRoot, { recursive: true, force: true }).catch(() => { });
+    }
+});
 // ── safety gate: a live session refuses migration ───────────────────────────
 
 test('migration: refuses to migrate a session with a live writer', async () => {

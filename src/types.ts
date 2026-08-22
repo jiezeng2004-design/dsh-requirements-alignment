@@ -53,6 +53,25 @@ export function validateAlignmentMode(value: unknown): AlignmentMode {
 }
 
 /**
+ * Where the effective alignment mode of one session came from. v0.4.0 adds the
+ * `session` layer (a session-scoped override) in front of the v0.3.0 shared
+ * layers (`override` = persisted runtime override, `profile` = profile default).
+ */
+export type AlignmentSource = 'session' | 'override' | 'profile';
+
+/**
+ * The resolved effective mode of one session and the layer that produced it.
+ * `effectiveModeFor(session)` on the controller returns this; every per-agent
+ * capability decision reads this shape.
+ */
+export interface EffectiveMode {
+    /** The mode in force for the session. */
+    mode: AlignmentMode;
+    /** Which layer produced `mode`. */
+    source: AlignmentSource;
+}
+
+/**
  * Finite drift taxonomy. A drift candidate is a direction-level change, not a
  * code-quality issue; see the policy text for what must never trigger it.
  */

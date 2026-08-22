@@ -3,7 +3,17 @@
 This roadmap records intended product direction; it is not a claim that the
 listed behavior ships in the current package.
 
-## v0.4.0 — session-scoped mode selector
+## v0.4.1 — session-scoped mode selector + Web capsule
+
+> **Status: implemented in the current package.** The four-layer resolution,
+> the `/align-mode session` command surface, per-session persistence (the
+> `SessionModeStore` sidecar), fork inheritance, and the per-agent capability
+> model are shipped, and v0.4.1 adds the `AlignmentCapsule` Web float driven by
+> the plugin's loopback management API. The package also folds DSH
+> `0.1.1-rc.1` compatibility (dependencies pinned to the rc.1 family, migration
+> parity with the real rc.1 writer/reader). The native Web session-local
+> selector below remains a host-UI option, not a DSH Core patch; see
+> `docs/ARCHITECTURE.md`.
 
 ### Outcome
 
@@ -40,11 +50,11 @@ the current session's effective mode.
 ### Selector surface
 
 The command surface above is the required fallback and works without DSH Core
-changes. The release should also provide a session-local selector in the Web
-client if DSH exposes a supported plugin UI contribution seam. If it does not,
-v0.4.0 must not patch Core: the command selector remains the supported surface,
-and the missing host UI seam is reported explicitly rather than simulated by
-editing profile files.
+changes. v0.4.1 ships the Web-client selector: an `AlignmentCapsule` float in
+the `shell.overlay` slot, driven entirely through the plugin's loopback
+management API (`/_dsh/requirements-alignment/*`) so the widget and the
+`/align-mode` command can never disagree. No DSH Core changes; no profile-file
+editing.
 
 ### Persistence and lifecycle
 

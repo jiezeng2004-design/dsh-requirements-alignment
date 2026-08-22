@@ -1,15 +1,19 @@
 # Architecture decision: Requirements Alignment as a runtime drift guard
 
-Date: session 2026-08 (DSH 0.1.0-rc.6, local checkout at
-`<dsh-home>/profiles/node_modules/@deepseek-ai` + the launcher package
-`@deepseek-ai/dsh` from the pnpm dlx cache).
+Date: session 2026-08 (baseline **DSH 0.1.1-rc.1**; earlier sessions audited
+against the local checkout at `<dsh-home>/profiles/node_modules/@deepseek-ai`
++ the launcher package `@deepseek-ai/dsh` from the pnpm dlx cache).
 
 **Canonical state (v0.2.2+):** alignment lives in the `AlignmentStateStore`
 sidecar (`storage-domain` → `storage-json`, unit `requirements_alignment`),
 keyed by session lifecycle identity. Production never appends `alignment/*`
 session events — those types exist only so legacy logs fold and migrate.
 v0.3.0 adds ModeStore + AlignmentRuntime hot switching and the always-on
-`/align-mode` command.
+`/align-mode` command. v0.4.0 adds the session-scoped mode selector:
+a `SessionModeStore` sidecar (`requirements_alignment_modes`) holds one
+override per session, and alignment capabilities are registered in each
+agent's OWN scope (`agent.ctx`) instead of at plugin scope — so two live
+sessions can hold different effective modes with zero leakage.
 
 ## 1. What v0.2 is
 
@@ -84,7 +88,10 @@ sidecar record:
 | `alignment/status` (legacy) | `{ kind: 'manual-check', at }` | v0.1 only — read for compatibility, never written |
 
 `SessionEventMap` augmentation is TypeScript-only; it is not runtime
-registration into `KNOWN_SESSION_EVENT_TYPES`.
+registration into `KNOWN_SESSION_EVENT_TYPES`. The invariant is semantic:
+at runtime `alignment/*` types never appear in the known set — `KNOWN_SESSION_EVENT_TYPES`
+is the official DSH rc.1 session-event vocabulary minus `alignment/*`, verified
+by intersection with the upstream set, not by a hand-maintained count.
 
 ## 5. Pure folds
 
@@ -189,9 +196,86 @@ so a resumed session knows exactly what the user picked without re-asking.
 
 ## 8. `/align` and `/align-mode`
 
-`/align-mode` is the always-on control command (including Off): no argument
-prints the three-layer snapshot; `auto` / `manual` / `off` persist a runtime
-override; `reset` returns to the profile default.
+`/align-mode` is the always-on control command (including Off), registered at
+plugin scope. No argument prints the **four-layer snapshot** of the calling
+session (session override / runtime override / profile default / effective
+mode with its exact source). `auto` / `manual` / `off` change the SHARED
+runtime override (persisted through the DSH Settings service); `reset` drops
+it back to the profile default. The `session` sub-command operates on ONLY the
+calling session: `session` / `session auto|manual|off` / `session reset`
+persist or drop that session's override in the `SessionModeStore` sidecar and
+resync that session's agent. Because `/align-mode` stays registered at plugin
+scope, an Off session can switch itself back without editing `settings.yaml`.
+
+## 8c. Per-agent capability model (v0.4.0)
+
+v0.3.0 registered policy, tools, `/align`, and `/align-migrate` at plugin
+scope and hot-switched ONE global set. v0.4.0 retires that: alignment
+capabilities are registered in each agent's own scope (`agent.ctx`) when the
+session starts, and the controller re-syncs an agent when its effective mode
+changes. DSH provides the per-session seam natively — `Agent.ctx` is an
+agent-scoped Cordis context whose contributions are agent-local and unwind on
+disposal, and the system-prompt / tools / commands registries all accept
+scoped registrations ("Scoped registrations shadow globals"). `/align-mode`
+is the only plugin-scope alignment contribution left.
+
+The controller owns the per-agent lifecycle:
+
+- `agent/session-start` → pin fork inheritance (alignment state AND session
+  override) and `syncAgent` (register the session's capabilities per its
+  effective mode).
+- `agent/disposed` → drop the bookkeeping (`agent.ctx` already unwound).
+- `ModeStore` change (shared) → re-sync every agent WITHOUT a session override.
+- `SessionModeStore` change → re-sync exactly that session's agent.
+- Unload → dispose the shared mode store, the `/align-mode` registration, and
+  every per-agent capability set explicitly.
+
+A mode transition in `syncAgent` is transactional (v0.4.1): the outgoing
+registrations are disposed first (scope-table removals are synchronous and
+never throw), then the incoming mode is registered and only a SUCCESSFUL
+registration is committed to `agentCapabilities`. A failed registration
+rolls back by RE-REGISTERING the previous mode with fresh disposers — the
+executed record is never put back, so a Map entry always corresponds to a live
+capability. If the rollback re-registration fails too, the agent fails loud and
+closed: the Map records nothing and the double failure (target mode, previous
+mode, both error provenances) is parked on `degradedAgents` for explicit
+reconciliation — the next sync trigger (session start, mode change, shared
+re-sync, disposal) retries and clears it. `registerForAgent` itself is
+self-cleaning: a mid-registration throw unwinds the partials it already
+collected before surfacing. Never a half-registered set, never a dead Map
+entry.
+
+### 8a. Mode mutations are ONE transaction (v0.4.1 source atomicity)
+
+The runtime rollback above is only half of the atomicity story: the PERSISTED
+mode source used to be committed first and was never compensated when the
+capability transition failed, leaving `effectiveMode` claiming the target while
+the runtime implemented the previous mode. The four mutations `setMode`,
+`resetMode`, `setSessionMode`, and `clearSessionOverride` now own the whole
+switch as one transaction:
+
+1. replay any PENDING source compensation (restore the previous topology);
+2. capture the previous source topology (presence + value);
+3. persist the target source;
+4. reconcile every affected agent's capabilities inside the same exclusive
+   window (the store subscriptions defer their own re-sync to the mutation);
+5. converge → the commit stands (and any stale pending compensation is
+   cleared);
+6. any agent that could not converge → compensate the source back to its
+   previous topology and THROW, so `/align-mode` and the management API
+   report failure and never claim the target is active.
+
+Session compensation keeps PRESENCE semantics: an inherited (override-less)
+session is compensated by clearing, never by writing an equal-value override;
+an explicit previous override is restored to its exact value. A compensating
+write that itself fails is recorded as an explicit pending source compensation
+(keyed by scope, exposed on the status payload with the ACTUAL active
+capability mode) and replayed at the start of the next mutation. A capability
+double failure with a successfully compensated source stays
+`capability-degraded` (no Map entry, both error provenances) until the next
+trigger. Invariant: the advertised effective mode equals the active capability
+mode in every stable state; the only advertised non-converged states are the
+explicit `source-compensation` and `capability-degraded` ones.
 
 ## 8b. `/align` — inspection, not a gate
 
@@ -230,22 +314,52 @@ pending-intent seam) without changing the event schema.
 
 | Seam | Use |
 |---|---|
-| `ctx.systemPrompt.section()` | drift-guard policy + folded baseline summary (order 60) |
-| `ctx.tools.register(defineTool(...))` | `establish_baseline` + `report_drift` (the plan-mode tool pattern) |
+| `agent.ctx` (agent-scoped Cordis context) | every per-agent capability registration (v0.4.0) — scoped `systemPrompt.section`, `tools.register`, `commands.register` |
+| `agent/session-start`, `agent/disposed` | per-agent capability sync + lifecycle bookkeeping |
+| `ctx.systemPrompt.section()` | drift-guard policy + folded baseline summary (order 60), scoped per agent |
+| `ctx.tools.register(defineTool(...))` | `establish_baseline` + `report_drift` (the plan-mode tool pattern), scoped per agent |
 | `ctx.userQuestions.ask()` | the drift question (native channel, agent + signal attached) |
-| `ctx.commands.register()` | `/align` (exact `CommandDefinition` contract) |
+| `ctx.commands.register()` | `/align` + `/align-migrate` (scoped per agent) and `/align-mode` (plugin scope) |
 | `agent.steer()` + `createUserMessage` | `/align` hands the fresh check to the agent |
-| `ctx.storageDomain` | canonical `AlignmentStateStore` sidecar |
-| `ctx.get('settings')` / `settings.register` | runtime mode override (v0.3.0) |
+| `ctx.storageDomain` | canonical `AlignmentStateStore` sidecar + `SessionModeStore` sidecar (v0.4.0) |
+| `ctx.get('settings')` / `settings.register` | shared runtime mode override (v0.3.0) |
+| `ctx.get('agents')` | live-agent lookup for shared-layer resync |
 | `session.append()` + `SessionEventMap` augmentation | LEGACY `alignment/*` vocabulary only |
 | `agent/session-start`, `session/event` (driver) | dogfood-only snapshots + `/align` executor |
 | `ctx.inject(['commands'])` | optional dependency pattern (as `dsh-plan-mode`) |
+| `ctx.inject(['webServer'])` | management API under `/_dsh/requirements-alignment` (optional; web profile only) |
 | bundle patch layers (`dsh.bundle.patch` + `cordis.patch.yml`) | install/remove via `dsh plugin add/rm` |
+| `dsh.client.inject` + `scripts/build-client.mjs` → `lib/client.js` | Web UI floating capsule (`shell.overlay` slot), same injection recipe as `dsh-chatgpt-bridge` |
 
 Not used (deliberately): `ctx.planMode` (plan mode is a different product),
 `agent/pre-step` (no pending state in v0.2), session projections (the pure
 folds are the read face; an `alignment` projection can be registered later for
-client UIs without schema changes), client plugins.
+client UIs without schema changes).
+
+## 12a. Web UI floating capsule (v0.4.1+)
+
+The plugin ships a client half for DSH Web (`platform: web` client inject, the
+same recipe `dsh-chatgpt-bridge` uses). It registers the `AlignmentCapsule`
+into the frame-wide `shell.overlay` slot (`id: 'requirements-alignment',
+order: 50`) — a bottom-right collapsible capsule showing the current
+session's effective mode as a colored dot + label. Expanding it reveals a
+compact manager for the two mode layers the user controls:
+
+- **session layer** — `auto | manual | off | reset`, addressed to the current
+  session's override (`PUT` / `DELETE` `/_dsh/requirements-alignment/mode`);
+- **shared layer** — `auto | manual | off | reset`, the runtime override every
+  session without its own override inherits (`PUT` / `DELETE`
+  `/_dsh/requirements-alignment/shared-mode`).
+
+State is fetched (not inferred) from the loopback management API
+(`GET /status?sessionId=...`, polled every 2s while the page is visible), so
+the capsule can never disagree with the `/align-mode` command — both exercise
+the SAME `SessionModeStore` / `ModeStore`/controller paths. The API is mounted
+only when the optional `webServer` service is present (web profile); it is
+loopback-only with the same Host/Origin/CSRF-header guards as the bridge, so
+no third-party page can forge a mutation. See `src/management-api.ts` for the
+endpoint contract and `test/management-api.test.ts` + `test/client-render.test.ts`
+for the coverage.
 
 ## 13. Test strategy
 

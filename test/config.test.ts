@@ -7,6 +7,17 @@ import {
     resolveConfig
 } from '../src/index.ts';
 
+/**
+ * The shipped schema's `mode` union node, inspected structurally. The union
+ * builder stores its element schemas in `list`; typing the inspection
+ * explicitly keeps the callback parameter well-typed even when the upstream
+ * Schemastery type surface evolves (no implicit-any).
+ */
+interface ShippedUnionNode {
+    type: 'union';
+    list?: Array<{ value?: unknown }>;
+}
+
 /** Apply the shipped Config schema (the same object Cordis uses at load). */
 function applySchema(input?: unknown) {
     return ConfigSchema(input as never);
@@ -62,10 +73,10 @@ test('config: plugin Config is the shipped Schemastery schema (enum auto / manua
     assert.equal(RequirementsAlignmentController.Config, ConfigSchema);
     assert.equal(ConfigSchema.type, 'object');
     assert.equal(ConfigSchema.dict?.mode?.type, 'union');
-    assert.deepEqual(
-        ConfigSchema.dict?.mode?.list?.map((entry) => entry.value),
-        [...ALIGNMENT_MODES]
-    );
+    const union = ConfigSchema.dict?.mode as ShippedUnionNode | undefined;
+    assert.equal(union?.type, 'union');
+    const values = (union?.list ?? []).map((entry) => entry.value);
+    assert.deepEqual(values, [...ALIGNMENT_MODES]);
     assert.deepEqual([...ALIGNMENT_MODES], ['auto', 'manual', 'off']);
 });
 

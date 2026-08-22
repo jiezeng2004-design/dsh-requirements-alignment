@@ -2,6 +2,237 @@
 
 All notable changes to this project are documented here.
 
+## 0.4.1 - Web floating capsule + DSH 0.1.1-rc.1 compatibility
+
+The plugin now ships a client half for DSH Web — the floating manager the user
+asked for ("没有可以直接管理的悬浮框") — and is upgraded end-to-end to the
+real **DeepSeek Harness 0.1.1-rc.1** baseline (dependencies pinned to the rc.1
+family; migration + client + session parity validated against the actual rc.1
+writers and readers).
+
+### Added
+
+- **`AlignmentCapsule` (`src/client/index.js`, built to `lib/client.js`)** — a
+  bottom-right collapsible capsule registered into the frame-wide
+  `shell.overlay` slot (`id: 'requirements-alignment'`, `order: 50`), the same
+  client-injection recipe (`dsh.client.inject` + `scripts/build-client.mjs`)
+  that `dsh-chatgpt-bridge` uses. Collapsed: colored dot + effective-mode
+  label. Expanded: session-layer and shared-layer mode buttons (Auto / Manual /
+  Off / Reset), the effective mode + source, and the baseline summary rows.
+- **Loopback management API (`src/management-api.ts`)** — mounted only when the
+  optional `webServer` service is present, under
+  `/_dsh/requirements-alignment`. `GET /status?sessionId=` (four-layer picture
+  + baseline), `PUT`/`DELETE /mode?sessionId=` (session override),
+  `PUT`/`DELETE /shared-mode` (runtime override). Every mutation carries the
+  same Host/Origin/loopback/CSRF-header guards as the bridge; GET endpoints
+  never mutate.
+- Every mutation and read goes through the SAME controller paths as
+  `/align-mode`, so the capsule and the command can never disagree about the
+  mode model.
+- **Tests** — `test/management-api.test.ts` (all endpoints × happy/error/guard
+  paths) and `test/client-render.test.ts` (fake-React smoke render of the
+  bundle: ModuleLoader require('react'), collapsed/expanded capsule, `apply`
+  registering `shell.overlay` exactly once).
+
+### Changed (DSH 0.1.1-rc.1 compatibility)
+
+- **Dependency family upgraded to `0.1.1-rc.1`.** All runtime `@deepseek-ai/dsh-*`
+  dependencies, the `@deepseek-ai/dsh-agent` peer/dev dependency, and the
+  supporting packages are pinned to the real `0.1.1-rc.1` releases (published
+  in the npm registry; no range drift). `pnpm-lock.yaml` regenerated against
+  the rc.1 physical packages.
+- **`src/migration.ts` real-rc.1 parity.** The structural concatenated-frame
+  container, the JSONL layout (`SESSION_FORMAT_VERSION`, `SessionHeader`,
+  packed chunk rows, end-seed, fork lineage), and the legacy-event envelope
+  repair were audited and updated against the real rc.1 physical format. Two
+  new integration tests produce fixtures with the REAL rc.1 writer (`Context`
+  + `SessionStore` + packed `JsonlSessionPersistence`) and reload the migrated
+  artifacts through the real rc.1 reader: a full official-vocabulary session
+  with five legacy `alignment/*` events, and a fork child carrying
+  `parentSession` + `seedLength`. Only whitelisted legacy events are repaired
+  to `ignorable: true`; every other byte is preserved; the reader's resume
+  end-seed / interruption closer semantics are asserted exactly.
+- **Client slot registration fix (`src/client/index.js`).** The capsule's
+  `shell.overlay` slot registration no longer carries a function-valued label
+  (the existing contract expects a plain string/serializable entry), so the
+  registration is accepted by the rc.1 Web surface and `useSessions` reads the
+  live session list correctly.
+
+### Fixed (v0.4.1 release blockers)
+
+- **Capability transition rollback atomicity (`src/index.ts` +
+  `src/runtime-mode-controller.ts`).** The previous `syncAgent` disposed
+  the outgoing mode, then tried to register the incoming mode, and on failure
+  put the *already-disposed* registration record back into
+  `agentCapabilities` — dead bookkeeping (the runtime had already lost the
+  old capability while the Map still advertised it). Transitions are now
+  transactional:
+
+  - the outgoing registrations are disposed first (synchronous, idempotent
+    scope-table removals that never throw);
+  - the incoming mode is registered; only a successful registration is
+    committed to the Map;
+  - a failed registration rolls back by **re-registering the previous mode
+    with fresh disposers** — the executed record is never put back;
+  - if the rollback re-registration fails too, the session fails loud and
+    closed: the Map records nothing (a Map entry must always correspond to a
+    live capability) and the double failure is recorded explicitly on
+    `degradedAgents` (target mode, previous mode, primary + rollback error
+    provenance) as pending reconciliation — the next sync trigger retries and
+    clears it;
+  - `registerForAgent` itself is now self-cleaning: a mid-registration
+    throw unwinds the partials it already collected before surfacing, so no
+    half-registered capability set can leak into a rollback;
+  - `resyncSharedAgents` also retries degraded (fail-closed) agents, so a
+    shared-layer change is a recovery window for a double failure.
+
+- **Mode source / active capability atomicity (`src/index.ts`).** The
+  capability rollback made the RUNTIME transaction atomic, but the persisted
+  mode SOURCE was still committed first and never compensated on a capability
+  failure — a failed switch could leave `effectiveMode = auto` (source) while
+  the runtime implements `manual`. Every mode mutation is now ONE
+  transaction (`setMode`, `resetMode`, `setSessionMode`, `clearSessionOverride`):
+
+  - the previous source topology is captured (presence + value);
+  - the target is persisted, then every affected agent's capabilities are
+    reconciled against it inside the same synchronous window (subscription
+    resyncs are deferred to the mutation);
+  - if ANY agent could not converge, the persisted source is compensated back
+    to its previous topology — a failed Manual `→` Auto switch reports failure
+    and leaves source = effective = capability = Manual;
+  - session overrides keep PRESENCE semantics: an inherited (override-less)
+    session is compensated by clearing (never an equal-value override), an
+    explicit previous override is restored to its exact value;
+  - a failed mode switch no longer reports the target as active: `setMode` /
+    `setSessionMode` / `resetMode` / `clearSessionOverride` throw, `/align-mode`
+    returns the existing `Failed to switch alignment mode: ...` error style,
+    and the management API returns the existing 4xx/5xx structured error;
+  - a compensating source write that itself fails is recorded as an explicit
+    PENDING source compensation — exposed on the status payload
+    (`reconciliation: { pending, kind: 'source-compensation', activeCapabilityMode }`,
+    the actual active mode), retried at the start of the next mutation,
+    cleared the moment it lands;
+  - a capability double failure with a compensated source stays
+    `capability-degraded` (no Map entry, both error provenances, the previous
+    active mode exposed) and recovers on the next trigger;
+  - `assertAgentModeConsistent` (advertised effective mode == active capability
+    mode) and `assertAgentModeDegraded` are asserted in every regression test;
+    the A—G matrix in `external-settings-failure.test.ts` covers shared /
+    session compensation, presence restoration, compensation-write failure,
+    double capability failure, and the success paths.
+
+- **Stale-session Web Capsule race (`src/client/index.js`).** The capsule's
+  `refresh` captured `currentSessionId` in its closure, so an
+  out-of-order response (Session A's status landing after Session B's) could
+  overwrite the current session's snapshot — showing A's state under B's
+  controls. The capsule now holds the live session id in a ref plus a request
+  generation counter:
+
+  - the generation is bumped and the snapshot cleared the moment the session
+    identity changes (including to no session);
+  - a response is committed only when its captured generation AND session id
+    still match the live session (late responses are dropped);
+  - the render layer only displays a snapshot whose session id equals the
+    current session (defensive identity check);
+  - with no selected session, session-scoped buttons are disabled and no
+    `?sessionId=undefined` request can ever be built (shared actions stay
+    usable).
+
+- **Typecheck regression fix** — `tsconfig.check.json` (src + test) reported
+  the client fake-React gaps after the halo; the capsule now also uses
+  `useRef`, and both client test files type-check strict with zero errors.
+
+### Verification
+
+- Type checking (both tsconfigs), linting, and build **PASS**.
+- Node tests: **228/228 passing** (largely rewritten for the rc.1 seams,
+  plus `client-render`, `management-api`, `session-mode-store`,
+  `session-mode`, the two real-rc.1 migration parity suites,
+  `client-race` — a real hooks/effects stale-session race harness — and the
+  A–G mode-source/capability transaction matrix in
+  `external-settings-failure`).
+- Packed-artifact smoke against a real `0.1.1-rc.1` DSH installation: the
+  tarball installs into a disposable profile (the real `dsh plugin` forwarder
+  + bundle reconciliation), `--dump-config` shows exactly the plugin's two rows
+  (`requirements-alignment` `mode: auto` + `requirements-alignment-ask-user`),
+  a real headless boot mounts the plugin service and, with a live agent
+  created through the real registry, the full capability matrix is present
+  from the real registries — policy section in the assembled system prompt,
+  `establish_baseline` + `report_drift` tools, `/align` + `/align-mode`
+  commands. Mode persistence fails *loud* (entry-only port) when the
+  storage-domain sidecar is absent, exactly as designed; removing the bundle
+  leaves no leftover rows in the composed tree. External model completion was
+  unavailable (`QUOTA`) and is reported separately, never counted as a model
+  E2E pass (see `ACCEPTANCE.md`).
+
+### Known limitations
+
+- The floating capsule is validated end-to-end short of a browser window: the
+  rebuilt bundle is served by the live DSH Web `0.1.1-rc.1` instance
+  (`/plugins/dsh-requirements-alignment/client.js`, 21697 bytes, P1
+  markers present), the loopback management API guard contract (400/404/403)
+  was verified live, and the capsule's render behavior is executed by the
+  real-hooks race harness (`client-race.test.ts`) plus the render test
+  (`client-render.test.ts`). A pixel-level browser-window E2E and any
+  live-model completion were unavailable this round (no browser automation;
+  model `QUOTA: Insufficient Balance`) and are not claimed as executed
+  passes — see `ACCEPTANCE.md`.
+- The `dsh plugin` registry reconcile over the flaky npm network during the
+  disposable smoke required an offline store re-run for full parity; the plugin
+  bundles themselves never depend on the network once fetched.
+
+## 0.4.0 - session-scoped mode selector
+
+### Added (session-scoped mode)
+
+- **`SessionModeStore` (`src/session-mode-store.ts`)** — one alignment-mode
+  override per session lifecycle identity (`id + createdAt + cwd`), persisted
+  to its own `requirements_alignment_modes` storage-domain sidecar
+  (durable-first writes, identity binding, fork inheritance, change
+  notification).
+- **Four-layer resolution** — `valid session override -> valid persisted
+  runtime override -> valid profile default -> auto`. `effectiveModeFor`
+  reports the mode and its exact source (`session` / `override` / `profile`).
+- **`/align-mode session`** — set, inspect, or reset the override of ONLY the
+  calling session; the shared runtime override and other live sessions never
+  move. `/align-mode` (no argument) prints the four-layer snapshot.
+- **Per-agent capability model** — policy section, both tools, `/align`, and
+  `/align-migrate` are registered in each agent's OWN scope (`agent.ctx`)
+  instead of at plugin scope. Two live sessions can hold different effective
+  modes with zero leakage; an Off session has no alignment capabilities at all
+  (only the plugin-scope `/align-mode` remains, so it can switch itself back).
+  `AlignmentRuntime` becomes a per-agent registrar (`registerForAgent`);
+  the v0.3.0 global register/dispose hot-switch is retired.
+- **Per-agent lifecycle** (`agent/session-start`, `agent/disposed`, ModeStore /
+  SessionModeStore subscriptions) — the controller syncs an agent's
+  capabilities when its session's effective mode changes; a failed per-agent
+  registration rolls back its partials, keeps the previous capability set, and
+  recovers on the next trigger.
+- **Fork inheritance** — a fork child adopts the parent's session override at
+  its seed boundary (one-time copy), then becomes independently changeable.
+- **Durability** — session overrides survive cold resume (restored per
+  identity) and are never touched by a shared reset; mode persistence,
+  session-mode persistence, and alignment-state persistence stay fully
+  independent.
+
+### Changed (architecture)
+
+- The v0.3.0 global capability matrix (Auto/Manual/Off at plugin scope) is now
+  a per-session matrix. Tests for the global register/dispose model
+  (`hot-switch`, `controller`, `external-settings-failure`,
+  `runtime-mode-controller`) were rewritten for the per-agent model; new
+  `session-mode` and `session-mode-store` suites cover isolation, resolution,
+  fork inheritance, and durability.
+
+### Added (verification)
+
+- New dogfood scenario `13-session-mode`: the align-driver switches ONLY the
+  top-level session to Off once a subagent session appears, and asserts the
+  subagent keeps its policy while the top-level agent loses policy, tools, and
+  `/align`.
+- `align-driver` gains `switchTopLevelOnSubagent` / `switchTopLevelTo` and
+  per-agent registration records.
+
 ## 0.3.0 - 2026-08-20
 
 ### Added (persistent runtime mode & hot switching)

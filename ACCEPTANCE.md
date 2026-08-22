@@ -1,3 +1,155 @@
+# Acceptance report — dsh-requirements-alignment v0.4.1
+
+Date: 2026-08-21 · package 0.4.1 · DSH 0.1.1-rc.1 · workspace: `<local-workspace>`
+
+v0.4.1 closes the current unreleased line by folding **DSH 0.1.1-rc.1
+compatibility** directly into v0.4.0's Web floating-capsule scope (no version
+bump beyond 0.4.1). Scope: the Web floating capsule + DSH 0.1.1-rc.1
+compatibility + rc.1 migration parity + typecheck fix + client slot contract
+fix. The plugin remains a soft runtime drift guard; the no-DSH-Core-patch
+boundary and the sidecar-owning persistence design are unchanged.
+
+## v0.4.1 checklist
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | Dependency family pinned to real `0.1.1-rc.1` (no line drift, no `0.0.1-rc.1` fallout) | ✅ | `package.json` + `pnpm-lock.yaml` use exact `0.1.1-rc.1` pins; reused offline store, no stray registrations. |
+| 2 | Typecheck green on both tsconfigs | ✅ | `tsc -p tsconfig.json` EXIT=0; `tsc -p tsconfig.check.json` EXIT=0. |
+| 3 | Lint green | ✅ | eslint EXIT=0. |
+| 4 | Full node suite green on the rc.1 family | ✅ | **228/228 passing** (0 fail), including the A–G mode-source/capability transaction matrix. |
+| 5 | Migration parity with the real rc.1 writer/reader | ✅ | Real writer fixtures migrate through the real rc.1 reader with seq continuity, header, packed chunk rows, resume end-seed, and fork (`parentSession`/`seedLength`) lineage preserved. |
+| 6 | Only whitelisted legacy events become `ignorable`; everything else byte-preserved | ✅ | `decoding`/`sequenceToLegacy`/`encodeSegment` unchanged; repo bytes for header, packed rows, end-seed, fork metadata preserved outside the 6-type whitelist. |
+| 7 | Client slot registration contract (no function-valued label) | ✅ | `src/client/index.js` `shell.overlay` registration; `test/client-render.test.ts` asserts exactly one accepted registration. |
+| 8 | Packed add / boot / remove cycle clean on a real rc.1 installation | ✅ | Real `dsh plugin add` reconciles the bundle; `--dump-config` composes the two plugin rows; a real headless boot mounts the service, verifies the full registration matrix live (policy section in the assembled prompt, `establish_baseline` + `report_drift` tools, `/align` + `/align-mode` from real registries); `dsh plugin remove` leaves zero rows and no leftover node_modules. |
+| 9 | Session-mode persistence contract unchanged | ✅ | `entryOnlySessionModePort` fails loud when storage-domain is absent; 11 `session-mode-store` unit tests. |
+| 10 | Production still appends zero `alignment/*` | ✅ | `KNOWN_SESSION_EVENT_TYPES` is the official rc.1 semantic set; `alignment/*` types are never runtime-registered (intersection invariant, not a fixed count). |
+| 11 | Capability transition rollback atomicity (P0) | ✅ | `syncAgent` transitions are transactional: dispose → register → only a successful registration is committed to the Map; a failure ROLLS BACK by re-registering the previous mode with FRESH disposers (the executed record is never put back); a rollback failure FAILS LOUD into `degradedAgents` (pending reconciliation) with both error provenances. Tests A–D in `external-settings-failure.test.ts`. |
+| 12 | Stale-session Web Capsule race (P1) | ✅ | The capsule holds the live session id in a ref plus a request-generation counter; responses are committed only when generation AND session id still match (late A/B responses are dropped); a session → no-session switch invalidates the snapshot immediately and no `?sessionId=undefined` request can ever be built. Tests E–H in `client-race.test.ts` run the production bundle against a REAL hooks/effects renderer (the previous fake `useEffect` was a no-op). |
+| 13 | No fake map state / no reused disposers | ✅ | `agentCapabilities` is observable and the invariant "every entry corresponds to a live capability" is asserted directly (rollback record never equals the executed record); A–F assert live tool/command counts and fresh-disposer unwinding. |
+| 14 | Mode source / active capability atomicity (P0) | ✅ | A mode mutation is ONE transaction: persist the target source → reconcile every affected agent's capabilities → on a failed transition COMPENSATE the persisted source back to its previous topology (presence-preserving for session overrides) → report FAILURE. The advertised effective mode equals the live capability mode in every stable state; the only exposed non-converged states are the explicit capability-degraded (double failure) and pending source-compensation ones. Tests A–G in `external-settings-failure.test.ts`. |
+
+Node tests: **228/228 passing**; typecheck, lint, and build green.
+
+### P0 — capability transition rollback atomicity (verified)
+
+- Manual → Auto with the incoming registration failing: the previous **Manual** set is RE-REGISTERED with fresh disposers (the map record is not the disposed one), the live tool/command matrix is intact, and the failed auto registration's partials were unwound inside `registerForAgent` (no half-registered set can leak into a rollback). The mutation REJECTS and the persisted source is compensated back to Manual, so the advertised effective mode AND the active capability mode both stay `manual` — never a silent "auto requested / manual active" split.
+- Auto → Manual with the incoming registration failing (shared, plus the session-override variant): the previous **Auto** set is re-registered fresh; no leaked tools/commands (exactly one of each surviving command); the shared/session override is compensated back — a session that inherited Auto is compensated by CLEARING (the override never reappears as an equal-value record).
+- Double failure (incoming register AND rollback both fail): the Map records NOTHING, the double failure is parked on `degradedAgents` with both error messages, an error-level log entry carries both provenances (fail loud), AND the persisted source is compensated back. Recovery: the next session-override sync re-registers and clears the degraded marker.
+- Success path: Manual → Auto → Manual → Off → Auto plus a session-override clear restores the profile default; every Map record matches the live capability matrix at each step and the advertised effective mode equals the active capability mode.
+
+### P0 — mode source / active capability atomicity (verified)
+
+- Shared transition compensation (A/B): a failed Manual → Auto and Auto → Manual SHARED switch rejects the mutation, re-registers the previous capability set fresh, and compensates the shared source to its previous topology; `/align-mode` reports `Failed to switch alignment mode: ...` (never `Switched to Auto.`), and the management API returns the existing 4xx/5xx structured error (never a target-active 200).
+- Session override compensation (C/D): a failed `session inherited Auto → Manual` switch leaves the session override ABSENT (presence semantics — never an equal-value override); a failed `session explicit Off → Manual` switch restores the exact previous `Off` override.
+- Compensation-write failure (E): when the compensating source write itself fails, the system records an explicit PENDING source compensation — the status payload exposes `source-compensation` with the ACTUAL active capability mode; the next mutation replays the compensation first and converges (source Manual, active Manual, pending cleared).
+- Double capability failure with compensated source (F): the agent is `capability-degraded` (no Map entry, both error provenances, status shows the actual previous active mode) and recovers on the next trigger.
+- Public API failure semantics: `setMode` / `resetMode` / `setSessionMode` / `clearSessionOverride` throw on a failed transition (after compensating the source); `/align-mode` uses the existing command-error style; the management API returns the existing structured error contract. No path reports the target as active unless BOTH the persisted source and the live capabilities converged.
+
+- Consistency invariant (asserted in every stable test): advertised `effectiveMode` == active `agentCapabilities.mode` (`assertAgentModeConsistent`); the only advertised non-converged states are the explicit `capability-degraded` / `source-compensation` ones (`assertAgentModeDegraded`).
+
+### P1 — stale-session Web Capsule race (verified with real hooks)
+
+- E — Session A → B with out-of-order responses: A's late response never renders; the UI shows only B.
+- F — A → no-session: the snapshot clears immediately, session-scoped buttons are disabled, shared actions still work, and no `sessionId=undefined` request is ever constructed.
+- G — with an old A request still in flight, a session mutation always targets the CURRENT session B (never A), and the post-mutation refresh targets B.
+- H — rapid A → B → C resolving out of order: only C is ever shown.
+
+Packed add / boot / remove cycle against a real `0.1.1-rc.1` DSH installation:
+**PASS** — re-verified end-to-end this round with an isolated disposable
+`DSH_HOME` (`.dsh-dogfood`, the plugin's own dogfood home — never the
+user's real ~/.dsh profile):
+
+- **Runtime family parity fixed and guarded**: the align-headless dogfood
+  profile was found pinned to the STALE `0.1.0-rc.6` family (the earlier
+  rounds' "packed rc.1" boots actually ran on that rc.6 runtime, where
+  `commands.execute` has the 3-arg signature and the plugin's 4-arg calls
+  could never execute). The profile was upgraded to the exact `0.1.1-rc.1`
+  family (overrides pin ALL `@deepseek-ai/dsh-*` transitive packages to
+  `0.1.1-rc.1`, no rc.2 drift), and the packed smoke now ASSERTS the
+  disposable runtime versions (dsh-headless / dsh-commands / dsh-base =
+  `0.1.1-rc.1`) before any boot;
+- pack → tarball → disposable-profile offline install → plugin-not-preinstalled →
+  `dsh plugin add` installs `0.4.1`, dep spec matches the tarball,
+  installed package is a regular directory isolated from the source checkout;
+- composition includes exactly the two plugin rows;
+- live headless boots at Auto / Manual / Off (real rc.1 registries): the full
+  capability matrix is present pre-model — Auto = policy section +
+  `establish_baseline`/`report_drift` + `/align` + `/align-mode`;
+  Manual = tools + `/align` + `/align-mode` without the policy section;
+  Off = only the always-on `/align-mode`. The policy section is asserted in
+  the assembled system prompt, `establish_baseline` writes revision 1
+  through the packed install's real tools registry, and `/align` executes
+  through the real commands registry;
+- **Runtime mode-switch probe (v0.4.1)**: the dogfood align-driver now runs
+  the REAL `/align-mode` command through the real commands registry at boot
+  and records the capability matrix before/after. B → Auto boots at auto
+  and switches the shared layer to Manual (effective `manual/override`,
+  policy section gone, tools kept); A → Manual boots at manual and
+  switches to Auto (effective `auto/override`, full auto matrix back). Both
+  switches execute through the real rc.1 commands service and the effective
+  mode always equals the live capability mode;
+- remove → zero leftover rows, no leftover `node_modules/dsh-requirements-alignment`,
+  manifest restored.
+- The model-dependent half of dogfood scenario 13 and any live-model completion
+  were unavailable during this run (`QUOTA: Insufficient Balance`) and are
+  reported separately — they are **not** presented as successful model E2E runs.
+
+Live GUI gate (real DSH Web `0.1.1-rc.1` running at {loopback}:3080, web profile
+dev-linking this checkout): **PASS for everything executable without a browser.**
+
+- GET /plugins/dsh-requirements-alignment/client.js serves the rebuilt capsule
+  bundle (21697 bytes) containing the P1 markers (`requestVersionRef`,
+  `snapshotForSession`, `currentSessionRef`, the `?sessionId=undefined` guard,
+  `shell.overlay` slot) — the exact bytes the browser tab loads;
+- the loopback management API is mounted live: GET /status without a sessionId
+  → 400 (sessionId required), GET /status?sessionId=<unknown> → 404 (session not live),
+  PUT /mode without the Host/Origin/CSRF-header guard → 403 — the full guard
+  contract runs on the live rc.1 server;
+- the capsule render behavior itself was executed by the headless real-hooks
+  harness (client-race E–H) — no browser automation exists in this environment,
+  so a pixel-level "capsule visible in a browser window" is NOT claimed here; the
+  served bytes + live backend contract + real render execution together form
+  this round's GUI evidence.
+
+---
+
+# Acceptance report — dsh-requirements-alignment v0.4.0
+
+Date: 2026-08-21 · package 0.4.0 · DSH 0.1.0-rc.6 · workspace: `<local-workspace>`
+
+v0.4.0 is the **session-scoped mode selector** release. Direction is
+unchanged: the plugin is a soft runtime drift guard. This round lets one
+session use Auto, Manual, or Off without changing the effective mode of other
+live sessions, keeps the v0.3.0 profile/runtime mode as the shared fallback,
+and preserves the no-DSH-Core-patch boundary.
+
+## v0.4.0 checklist
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | Two concurrent sessions hold different effective modes with no leakage | ✅ | `session-mode.test.ts`: Session A off + Session B manual + Session C shared auto, disjoint capability sets. |
+| 2 | Changing Session A never changes Session B or the shared runtime override | ✅ | `session-mode.test.ts`: `/align-mode session manual` on A leaves B and `modeStore` untouched. |
+| 3 | Auto/Manual/Off correct per session on new, resumed, forked, and historically forked sessions | ✅ | per-agent capability matrix + `persistence-regression` cold-resume/fork paths; fork inherits the parent override once. |
+| 4 | Session reset and shared reset affect only their documented layer | ✅ | `/align-mode session reset` drops only the session override; `resetMode` drops only the shared override. |
+| 5 | Persistence and registration failures leave no split-brain state | ✅ | `external-settings-failure.test.ts`: failed shared persist leaves snapshot + agents untouched; failed per-agent registration rolls back partials and recovers. |
+| 6 | The selector remains usable when the current session is Off | ✅ | `/align-mode` is plugin-scope; `session-mode.test.ts` switches an Off session back to auto. |
+| 7 | Four-layer resolution with the exact effective source | ✅ | `effectiveModeFor` returns `session` / `override` / `profile`; `/align-mode` prints all four layers. |
+| 8 | Session override durability (identity binding, cold resume) | ✅ | `session-mode-store.test.ts`: durable-first writes, id-reuse shadowing, store-recreation survival. |
+| 9 | No DSH Core changes | ✅ | Agent-scoped registration (`agent.ctx`) + storage-domain sidecar; no `@deepseek-ai/*` modification. |
+| 10 | Production still appends zero `alignment/*` | ✅ | Persistence regression suite unchanged. |
+
+Node tests: **188/188 passing**; typecheck, lint, and build green.
+
+Packed add/install/compose against the current 0.4.0 tarball: **PASS**. The
+Auto/Manual/Off boot verification and the model-dependent half of dogfood
+scenario 13 require a live external model, which was unavailable during this
+run (`QUOTA: Insufficient Balance`); those layers are reported separately and
+are not presented as successful model E2E runs. The dogfood driver DID confirm
+(pre-model, deterministic) that the top-level agent registers its full auto
+capability set in its own scope on a real boot.
+
+---
+
 # Acceptance report — dsh-requirements-alignment v0.3.0
 
 Date: 2026-08-20 · package 0.3.0 · DSH 0.1.0-rc.6 · workspace: `<local-workspace>`

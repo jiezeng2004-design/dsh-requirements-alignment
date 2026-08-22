@@ -103,3 +103,41 @@ A scenario can fail with an empty final message and `llm/retry` events
 (`EMPTY_RESPONSE` / `RATE_LIMIT` / `TIMEOUT`) in the persisted session log.
 That is external service variance, not a plugin defect. Retry the scenario
 once; if it fails again, investigate before more retries.
+
+## 8b. QUOTA: Insufficient Balance is an environment limit, not a defect
+
+When the external model API reports `QUOTA: Insufficient Balance`, every
+real-agent scenario that needs a model call (subagent creation, drift
+questions, task completion) cannot complete — the process exits non-zero
+before the model runs. This is not a plugin defect; do NOT "fix" the plugin
+or the model for it. The dogfood driver still records the deterministic
+pre-model behavior (per-agent capability registration at `agent/created`),
+so assert that, mark the model-dependent assertions as QUOTA-limited, and
+report the quota separately rather than claiming a mechanism pass (v0.4.0
+scenario 13 and packed-smoke boot behave this way). Refill the balance before
+re-running the full gate.
+
+## 9. DSH 0.1.1-rc.1 boot / probe rules (v0.4.1)
+
+Learned during the v0.4.1 packed smoke against the real rc.1 installation:
+
+- `dsh --profile <name> --dump-config` always works without mounting anything
+  (boot-free), so composition can be verified deterministically.
+- A base headless boot (no `--dump-config`) hangs waiting on the LLM with zero
+  output — no `sessions/` dir is created. An agent that is created but never
+  asked to continue (`agents.create` without a followup) does NOT wake the
+  model (`whenIdle` escapes), enabling a real agent with a full registration
+  matrix, quota-free.
+- `--patch` overlays apply only after the `@deepseek-ai/dsh-headless` bundle is
+  in `dsh.profile.bundles`; without it the headless code-runtime rows never
+  mount.
+- The headless runner still requires a task positional (`error: a task is
+  required`) — always pass a task string even when the probe self-exits.
+- To attach application code to a boot, wrap it in `--patch` with an explicit
+  `inject: [...]` list (dependency-free rows mount first); a bare patch applies
+  before any injectable service exists.
+- `/align-mode session` with no storage-domain mounted fails loud with "cannot
+  persist a session mode override: no storage-domain service is mounted" — that
+  is the design fail-open (entry-only port), not a defect.
+- All smoke home/probe state must live under an isolated disposable `DSH_HOME`
+  (temp dir), never the user's real `~/.dsh`.

@@ -26,10 +26,14 @@
  * (over-repairing would hide exactly the incompatibility this tool must not
  * paper over).
  *
- * Never treat `.jsonl.zstd` as text: the codec below is the migration-specific
- * strict re-implementation of the rc.6 concatenated-frame container
- * (magic, frame header, block walk, 4-byte content checksum), re-encoding
- * with the same checksummed frames the backend writes.
+ * Never treat `.jsonl.zstd` as text: the codec below is a structural
+ * re-implementation of the DSH JSONL session-persistence concatenated-frame
+ * container (magic, frame header, block walk, 4-byte content checksum),
+ * re-encoding with the same checksummed frames the backend writes. It is
+ * validated byte-for-byte against the supported DSH baseline's own encoder
+ * (`test/migration.test.ts` asserts the parity fixture loads through the real
+ * `0.1.1-rc.1` reader), and the backend's public reader gate
+ * (`verifyWithRealReader`) keeps this module honest at every migration run.
  *
  * @module dsh-requirements-alignment/migration
  */
@@ -137,7 +141,7 @@ export async function compressZstdFrame(input: string | Buffer): Promise<Buffer>
     return zstdCompressAsync(Buffer.from(input), CHECKSUM_OPTIONS);
 }
 
-/** The artifact layout helpers (mirrors of the rc.6 JSONL backend). */
+/** The artifact layout helpers (mirrors of the DSH JSONL session-persistence backend). */
 function encodeSegment(raw: string): string {
     if (raw.length === 0) throw new Error('cannot encode an empty path segment');
     if (raw === '.') return '~002E';
@@ -186,7 +190,7 @@ export function compressionOf(filename: string): ArtifactCompression | undefined
     return undefined;
 }
 
-/** Structural header validation mirroring the rc.6 backend's `isHeaderLine`. */
+/** Structural header validation mirroring the DSH JSONL backend's `isHeaderLine`. */
 export function parseAndValidateHeaderLine(line: string): SessionHeader {
     let parsed: unknown;
     try {

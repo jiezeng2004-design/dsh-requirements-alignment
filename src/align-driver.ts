@@ -75,6 +75,25 @@ export interface AlignDriverConfig {
      * packed smoke Auto → Manual → Off cycle.
      */
     verifyRegistrations?: boolean;
+    /**
+     * Two-session isolation probe (dogfood 13): once a SUBAGENT session
+     * appears, switch the recorded top-level agent to a session override
+     * (`switchTopLevelTo`, default `off`) and record the top-level agent's
+     * capability matrix before and after. The subagent itself keeps the mode
+     * it inherited at creation, proving two sessions hold different effective
+     * modes with no leakage.
+     */
+    switchTopLevelOnSubagent?: boolean;
+    /** The session mode the top-level agent is switched to (default `off`). */
+    switchTopLevelTo?: 'auto' | 'manual' | 'off';
+    /**
+     * Switch the SHARED runtime override through the REAL `/align-mode`
+     * command at top-level session start (packed mode-switch smoke, v0.4.1):
+     * the capability matrix is recorded BEFORE and AFTER the switch, proving
+     * the transactional commit (persisted source AND live capabilities
+     * converge, advertised effective mode matches the active capability mode).
+     */
+    switchSharedModeTo?: 'auto' | 'manual' | 'off';
 }
 
 /** A validated, detached config. */
@@ -87,15 +106,27 @@ export interface ResolvedAlignDriverConfig {
     haltAtDecision?: boolean;
     verifyPolicySection?: boolean;
     verifyRegistrations?: boolean;
+    switchTopLevelOnSubagent?: boolean;
+    switchTopLevelTo?: 'auto' | 'manual' | 'off';
+    switchSharedModeTo?: 'auto' | 'manual' | 'off';
 }
 
 /** Validate driver config; unknown keys fail loud. */
 export function resolveAlignDriverConfig(config: AlignDriverConfig = {}): ResolvedAlignDriverConfig {
-    const unknown = Object.keys(config).filter((key) => key !== 'recordPath' && key !== 'runAlign' && key !== 'runBaselineProbe' && key !== 'injectAskUserCall' && key !== 'snapshotFirstMutation' && key !== 'haltAtDecision' && key !== 'verifyPolicySection' && key !== 'verifyRegistrations');
-    if (unknown.length > 0) throw new Error(`AlignDriverConfig has unknown key(s) ${unknown.join(', ')} - config is { recordPath?, runAlign?, runBaselineProbe?, injectAskUserCall?, snapshotFirstMutation?, haltAtDecision?, verifyPolicySection?, verifyRegistrations? }`);
-    for (const key of ['runAlign', 'runBaselineProbe', 'injectAskUserCall', 'snapshotFirstMutation', 'haltAtDecision', 'verifyPolicySection', 'verifyRegistrations'] as const) {
+    const keys = ['recordPath', 'runAlign', 'runBaselineProbe', 'injectAskUserCall', 'snapshotFirstMutation', 'haltAtDecision', 'verifyPolicySection', 'verifyRegistrations', 'switchTopLevelOnSubagent', 'switchTopLevelTo', 'switchSharedModeTo'];
+    const unknown = Object.keys(config).filter((key) => !keys.includes(key));
+    if (unknown.length > 0) throw new Error(`AlignDriverConfig has unknown key(s) ${unknown.join(', ')} - config is { recordPath?, runAlign?, runBaselineProbe?, injectAskUserCall?, snapshotFirstMutation?, haltAtDecision?, verifyPolicySection?, verifyRegistrations?, switchTopLevelOnSubagent?, switchTopLevelTo? }`);
+    for (const key of ['runAlign', 'runBaselineProbe', 'injectAskUserCall', 'snapshotFirstMutation', 'haltAtDecision', 'verifyPolicySection', 'verifyRegistrations', 'switchTopLevelOnSubagent'] as const) {
         const value = config[key];
         if (value !== undefined && typeof value !== 'boolean') throw new Error(`AlignDriverConfig ${key} must be a boolean`);
+    }
+    const to = config.switchTopLevelTo;
+    if (to !== undefined && to !== 'auto' && to !== 'manual' && to !== 'off') {
+        throw new Error(`AlignDriverConfig switchTopLevelTo must be 'auto', 'manual', or 'off', got ${JSON.stringify(to)}`);
+    }
+    const shared = config.switchSharedModeTo;
+    if (shared !== undefined && shared !== 'auto' && shared !== 'manual' && shared !== 'off') {
+        throw new Error(`AlignDriverConfig switchSharedModeTo must be 'auto', 'manual', or 'off', got ${JSON.stringify(shared)}`);
     }
     return {
         ...(config.recordPath === undefined ? {} : { recordPath: config.recordPath }),
@@ -105,7 +136,10 @@ export function resolveAlignDriverConfig(config: AlignDriverConfig = {}): Resolv
         ...(config.snapshotFirstMutation === undefined ? {} : { snapshotFirstMutation: config.snapshotFirstMutation }),
         ...(config.haltAtDecision === undefined ? {} : { haltAtDecision: config.haltAtDecision }),
         ...(config.verifyPolicySection === undefined ? {} : { verifyPolicySection: config.verifyPolicySection }),
-        ...(config.verifyRegistrations === undefined ? {} : { verifyRegistrations: config.verifyRegistrations })
+        ...(config.verifyRegistrations === undefined ? {} : { verifyRegistrations: config.verifyRegistrations }),
+        ...(config.switchTopLevelOnSubagent === undefined ? {} : { switchTopLevelOnSubagent: config.switchTopLevelOnSubagent }),
+        ...(config.switchTopLevelTo === undefined ? {} : { switchTopLevelTo: config.switchTopLevelTo }),
+        ...(config.switchSharedModeTo === undefined ? {} : { switchSharedModeTo: config.switchSharedModeTo })
     };
 }
 
@@ -172,6 +206,57 @@ function statusOf(store: AlignmentStateStore | undefined, agent: import('@deepse
 const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'web_search', 'skill', 'ask_user_question', 'establish_baseline', 'report_drift', 'todo_write']);
 
 /**
+ * Record one agent's alignment capability matrix from the live registries:
+ * policy section presence (assembled real system prompt), alignment tools
+ * (`establish_baseline`, `report_drift` — resolved in the agent's OWN scope,
+ * so an Off session reports no alignment tools), and `/align` + `/align-mode`
+ * (resolved per agent, so an Off session has no `/align`).
+ */
+async function recordAgentRegistrations(
+    ctx: import('@deepseek-ai/cordis').Context,
+    agent: import('@deepseek-ai/dsh-agent').Agent,
+    recordPath: string | undefined,
+    phase: string
+): Promise<void> {
+    try {
+        const tools = ctx.get('tools');
+        const commands = ctx.get('commands');
+        const systemPrompt = ctx.get('systemPrompt');
+        const toolNames = (['establish_baseline', 'report_drift'] as const).filter((name) => tools?.get(name, agent) !== undefined);
+        const align = commands?.find(agent, 'align') !== undefined;
+        const alignMode = commands?.find(agent, 'align-mode') !== undefined;
+        let policy = false;
+        if (systemPrompt !== undefined) {
+            const assembly = await systemPrompt.assemble(assembleContextFor(agent));
+            policy = assembly.sections.some((entry) => entry.name === POLICY_SECTION);
+        }
+        // The controller's live resolution for this session (diagnostics for
+        // the session-mode scenarios).
+        const service = ctx.get('requirementsAlignment') as
+            | { effectiveModeFor(session: unknown): { mode: string; source: string } }
+            | undefined;
+        const effective = service === undefined ? undefined : service.effectiveModeFor(agent.session);
+        record(recordPath, {
+            phase,
+            executed: true,
+            sessionId: String(agent.session.id),
+            effective: effective === undefined ? undefined : `${effective.mode}/${effective.source}`,
+            services: {
+                systemPrompt: systemPrompt !== undefined,
+                tools: tools !== undefined,
+                commands: commands !== undefined
+            },
+            policy,
+            tools: [...toolNames],
+            align,
+            alignMode
+        });
+    } catch (error) {
+        record(recordPath, { phase, executed: false, sessionId: String(agent.session.id), error: String(error) });
+    }
+}
+
+/**
  * Mount the driver: at every `agent/session-start`, record an initial
  * snapshot; optionally inject the isolation probe; for top-level agents run
  * `/align` through the real commands registry; and record a snapshot at every
@@ -191,8 +276,41 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
     // exists, while `statusOf` keeps the legacy fold as the fallback when no
     // store ever appears.
     const getStore = () => resolveStore(ctx);
+    let topLevelAgent: import('@deepseek-ai/dsh-agent').Agent | undefined;
+    let topLevelSwitched = false;
     ctx.on('agent/session-start', async ({ agent }) => {
         record(resolved.recordPath, snapshot(statusOf(getStore(), agent), agent, 'start'));
+        // Two-session isolation probe (dogfood 13): once a SUBAGENT session
+        // appears, switch the recorded top-level agent to a session override
+        // and record that agent's capability matrix before and after. The
+        // subagent keeps the mode it inherited at creation.
+        if (agent.session.header.origin === 'subagent') {
+            if (resolved.switchTopLevelOnSubagent === true && !topLevelSwitched && topLevelAgent !== undefined) {
+                topLevelSwitched = true;
+                const to = resolved.switchTopLevelTo ?? 'off';
+                await recordAgentRegistrations(ctx, topLevelAgent, resolved.recordPath, 'top-before');
+                try {
+                    const commands = ctx.get('commands');
+                    if (commands === undefined) {
+                        record(resolved.recordPath, { phase: 'top-switch', executed: false, error: 'no commands service' });
+                    } else {
+                        const execution = await commands.execute(topLevelAgent, `/align-mode session ${to}`, [], new AbortController().signal);
+                        record(resolved.recordPath, {
+                            phase: 'top-switch',
+                            executed: true,
+                            to,
+                            resultKind: execution?.result.kind,
+                            resultText: execution?.result.text
+                        });
+                    }
+                } catch (error) {
+                    record(resolved.recordPath, { phase: 'top-switch', executed: false, error: String(error) });
+                }
+                await recordAgentRegistrations(ctx, topLevelAgent, resolved.recordPath, 'top-after');
+            }
+        } else {
+            topLevelAgent ??= agent;
+        }
         if (resolved.injectAskUserCall === true) {
             try {
                 agent.session.append('tool/call', {
@@ -218,7 +336,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                 record(resolved.recordPath, { phase: 'align', executed: false, error: 'no commands service' });
             } else {
                 try {
-                    const execution = await commands.execute(agent, '/align', new AbortController().signal);
+                    const execution = await commands.execute(agent, '/align', [], new AbortController().signal);
                     record(resolved.recordPath, {
                         phase: 'align',
                         executed: true,
@@ -265,29 +383,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
             }
         }
         if (resolved.verifyRegistrations === true) {
-            try {
-                const tools = ctx.get('tools');
-                const commands = ctx.get('commands');
-                const systemPrompt = ctx.get('systemPrompt');
-                const toolNames = (['establish_baseline', 'report_drift'] as const).filter((name) => tools?.get(name) !== undefined);
-                const align = commands?.find(agent, 'align') !== undefined;
-                const alignMode = commands?.find(agent, 'align-mode') !== undefined;
-                let policy = false;
-                if (systemPrompt !== undefined) {
-                    const assembly = await systemPrompt.assemble(assembleContextFor(agent));
-                    policy = assembly.sections.some((entry) => entry.name === POLICY_SECTION);
-                }
-                record(resolved.recordPath, {
-                    phase: 'registrations',
-                    executed: true,
-                    policy,
-                    tools: [...toolNames],
-                    align,
-                    alignMode
-                });
-            } catch (error) {
-                record(resolved.recordPath, { phase: 'registrations', executed: false, error: String(error) });
-            }
+            await recordAgentRegistrations(ctx, agent, resolved.recordPath, 'registrations');
         }
         if (resolved.verifyPolicySection === true) {
             // Deterministic policy-presence proof: assemble the real system
@@ -309,6 +405,31 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
             } catch (error) {
                 record(resolved.recordPath, { phase: 'policy', executed: false, error: String(error) });
             }
+        }
+        // Packed mode-switch smoke (v0.4.1): run the REAL /align-mode command
+        // for the shared layer and record the capability matrix before and
+        // after - proves the transactional commit (persisted source AND live
+        // capabilities converge, effective mode matches the active mode).
+        if (resolved.switchSharedModeTo !== undefined) {
+            await recordAgentRegistrations(ctx, agent, resolved.recordPath, 'switch-before');
+            const commands = ctx.get('commands');
+            if (commands === undefined) {
+                record(resolved.recordPath, { phase: 'mode-switch', executed: false, error: 'no commands service' });
+            } else {
+                try {
+                    const execution = await commands.execute(agent, '/align-mode ' + resolved.switchSharedModeTo, [], new AbortController().signal);
+                    record(resolved.recordPath, {
+                        phase: 'mode-switch',
+                        executed: true,
+                        to: resolved.switchSharedModeTo,
+                        resultKind: execution?.result.kind,
+                        resultText: execution?.result.text
+                    });
+                } catch (error) {
+                    record(resolved.recordPath, { phase: 'mode-switch', executed: false, error: String(error) });
+                }
+            }
+            await recordAgentRegistrations(ctx, agent, resolved.recordPath, 'switch-after');
         }
     });
     let firstMutationRecorded = false;
