@@ -15,19 +15,19 @@ $ErrorActionPreference = 'Stop'
 $pluginRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $pluginRoot
 $dshHome = Join-Path $workspaceRoot '.dsh-dogfood'
+$launcherRoot = Join-Path $dshHome 'launchers\rc2'
 $profile = 'packed-smoke-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $tempRoot = Join-Path $workspaceRoot '_packed-smoke'
 $recordRoot = Join-Path $pluginRoot 'dogfood\records'
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
+$expectedDshVersion = '0.1.1-rc.2'
 $script:results = @()
 $script:scenarioDirs = @()
 
 function Resolve-DshLauncher {
-    $cmd = Get-Command dsh -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    $fallback = Join-Path $env:USERPROFILE '.dsh\profiles\node_modules\@deepseek-ai\dsh\node_modules\.bin\dsh.CMD'
-    if (Test-Path $fallback) { return $fallback }
-    throw 'dsh launcher not found: add it to PATH or install @deepseek-ai/dsh into the profile root node_modules'
+    $isolated = Join-Path $launcherRoot 'node_modules\.bin\dsh.CMD'
+    if (Test-Path -LiteralPath $isolated) { return $isolated }
+    throw "isolated rc.2 dsh launcher not found at $isolated"
 }
 
 function Add-Check {
@@ -76,7 +76,20 @@ function Remove-ManagedDirectory {
     }
 
     Write-Host "cleanup target verified: $targetFull (directory, $entryCount entries, no reparse points)"
-    Remove-Item -LiteralPath $targetFull -Recurse -Force -ErrorAction Stop
+    if ($env:OS -eq 'Windows_NT' -and $PSVersionTable.PSVersion.Major -lt 6) {
+        # Windows PowerShell 5's FileSystem provider still fails on deep pnpm
+        # paths. The target, exact parent, leaf pattern, type, and every
+        # reparse boundary were verified above before adding the long-path
+        # prefix for the delete operation.
+        $longTarget = if ($targetFull.StartsWith('\\')) {
+            '\\?\UNC\' + $targetFull.Substring(2)
+        } else {
+            '\\?\' + $targetFull
+        }
+        [IO.Directory]::Delete($longTarget, $true)
+    } else {
+        Remove-Item -LiteralPath $targetFull -Recurse -Force -ErrorAction Stop
+    }
     if (Test-Path -LiteralPath $targetFull) { throw "cleanup did not remove the exact target: $targetFull" }
 }
 
@@ -185,14 +198,30 @@ $switchLine
         $task = "Fix the typo in README.md."
     }
     Push-Location $scenarioDir
-    $output = & $script:dsh --profile $profile --patch $overlayPath $task 2>&1
-    $exit = $LASTEXITCODE
-    Pop-Location
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5 surfaces native stderr as ErrorRecord objects;
+        # Provider quota and a deliberately credential-free disposable DSH_HOME
+        # are expected pre-model boundaries. Capture both below instead of
+        # promoting native stderr to a terminating script error.
+        $ErrorActionPreference = 'Continue'
+        $output = & $script:dsh --profile $profile --patch $overlayPath $task 2>&1
+        $exit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        Pop-Location
+    }
     $outputText = $output | Out-String
-    $quotaUnavailable = $exit -ne 0 -and $outputText -match 'QUOTA:\s*Insufficient Balance'
-    Add-Check ($exit -eq 0 -or $quotaUnavailable) $(
-        if ($quotaUnavailable) {
-            "$Mode packed profile booted; external model completion unavailable (QUOTA)"
+    $modelUnavailableReason = if ($exit -ne 0 -and $outputText -match 'QUOTA:\s*Insufficient Balance') {
+        'QUOTA'
+    } elseif ($exit -ne 0 -and $outputText -match 'MISSING_CREDENTIAL:') {
+        'MISSING_CREDENTIAL'
+    } else {
+        ''
+    }
+    Add-Check ($exit -eq 0 -or $modelUnavailableReason) $(
+        if ($modelUnavailableReason) {
+            "$Mode packed profile booted; external model completion unavailable ($modelUnavailableReason)"
         } else {
             "$Mode packed profile booted and completed the task (exit $exit)"
         }
@@ -289,10 +318,10 @@ if (-not (Test-Path $dshHome)) {
     exit 1
 }
 
-$srcProfile = Join-Path $dshHome "profiles\align-headless"
+$srcProfile = Join-Path $dshHome "profiles\align-headless-rc2"
 if (-not (Test-Path $srcProfile)) {
-    Write-Host "PACKED SMOKE ENVIRONMENT: align-headless profile skeleton missing at $srcProfile"
-    Add-Check $false "align-headless profile skeleton exists"
+    Write-Host "PACKED SMOKE ENVIRONMENT: align-headless-rc2 profile skeleton missing at $srcProfile"
+    Add-Check $false "align-headless-rc2 profile skeleton exists"
     $passed = @($script:results | Where-Object { $_ }).Count
     Write-Host ("PACKED SMOKE SUMMARY: $passed/" + $script:results.Count + " passed")
     exit 1
@@ -341,23 +370,32 @@ $cleanManifest.dsh.profile.bundles = @(
     $utf8NoBom
 )
 Push-Location $dstProfile
-& pnpm install --offline 2>&1 | Out-Null
+$installOutput = & pnpm install --offline 2>&1
 $installExit = $LASTEXITCODE
 Pop-Location
+if ($installExit -ne 0) {
+    Write-Host 'disposable offline install failed:'
+    $installOutput | Select-Object -Last 30 | ForEach-Object { Write-Host $_ }
+}
 Add-Check ($installExit -eq 0) 'disposable profile installed offline from the shared store'
-# rc.1 runtime guard: the disposable profile must resolve the SAME 0.1.1-rc.1
-# DSH family the plugin pins (no range drift, no stale rc.x runtime).
+# rc.2 runtime guard: the disposable profile must resolve the SAME exact DSH
+# family the plugin pins (no range drift and no stale launcher/profile seam).
 $runtimeChecks = @(
+    @{ Name = 'dsh launcher'; Path = Join-Path $launcherRoot 'node_modules\@deepseek-ai\dsh\package.json' },
     @{ Name = 'dsh-headless'; Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-headless\package.json' },
     @{ Name = 'dsh-commands'; Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-commands\package.json' },
-    @{ Name = 'dsh-base';     Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-base\package.json' }
+    @{ Name = 'dsh-base';     Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-base\package.json' },
+    @{ Name = 'dsh-session';  Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-session\package.json' },
+    @{ Name = 'dsh-storage';  Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-storage\package.json' },
+    @{ Name = 'dsh-storage-domain'; Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-storage-domain\package.json' },
+    @{ Name = 'dsh-settings'; Path = Join-Path $dstProfile 'node_modules\@deepseek-ai\dsh-settings\package.json' }
 )
 foreach ($rc in $runtimeChecks) {
     $rcVer = ''
     if (Test-Path -LiteralPath $rc.Path) {
         $rcVer = [string](Get-Content -LiteralPath $rc.Path -Raw | ConvertFrom-Json).version
     }
-    Add-Check ($rcVer -eq '0.1.1-rc.1') "disposable $($rc.Name) runtime is 0.1.1-rc.1 (got: $(if ($rcVer) { $rcVer } else { 'missing' }))"
+    Add-Check ($rcVer -eq $expectedDshVersion) "disposable $($rc.Name) runtime is $expectedDshVersion (got: $(if ($rcVer) { $rcVer } else { 'missing' }))"
 }
 $preexistingInstall = Join-Path $dstProfile 'node_modules\dsh-requirements-alignment'
 Add-Check (-not (Test-Path -LiteralPath $preexistingInstall)) 'disposable profile starts without a workspace-linked plugin'
@@ -402,6 +440,7 @@ Reset-ModeState (Join-Path $dshHome 'settings.yaml')
 Invoke-ModeBoot -Mode 'manual' -TarballName $tarball.Name -ExpectPolicy $false -ExpectTools $true -ExpectAlign $true -SwitchTo 'auto'
 
 # ---------------------------------------------- 6. remove and verify restore
+Reset-ModeState (Join-Path $dshHome 'settings.yaml')
 & $script:dsh plugin --profile $profile rm dsh-requirements-alignment
 Add-Check ($LASTEXITCODE -eq 0) 'dsh plugin rm succeeded'
 $manifestAfterRm = Get-Content $manifestPath -Raw

@@ -1,6 +1,6 @@
 # Architecture decision: Requirements Alignment as a runtime drift guard
 
-Date: session 2026-08 (baseline **DSH 0.1.1-rc.1**; earlier sessions audited
+Date: session 2026-08 (baseline **DSH 0.1.1-rc.2**; earlier sessions audited
 against the local checkout at `<dsh-home>/profiles/node_modules/@deepseek-ai`
 + the launcher package `@deepseek-ai/dsh` from the pnpm dlx cache).
 
@@ -361,10 +361,20 @@ no third-party page can forge a mutation. See `src/management-api.ts` for the
 endpoint contract and `test/management-api.test.ts` + `test/client-render.test.ts`
 for the coverage.
 
+The package graph and the browser service graph are deliberately distinct.
+`package.json#dsh.client.inject` names only packages that provide real client
+entries: `@deepseek-ai/dsh-client-runtime` and
+`@deepseek-ai/dsh-client-locale`. `@deepseek-ai/dsh-client-ui-slots` has no
+`dsh.client` manifest and no `./client` export in rc.2, so naming it there
+would create an invalid client-graph dependency. Inside the loaded browser
+module, `const inject = ['slots', 'locale']` remains required: those are the
+Cordis runtime services used to register the `shell.overlay` occupant and
+resolve labels. `test/client-manifest.test.ts` locks both layers together.
+
 ## 13. Test strategy
 
-1. Unit (node:test on TS sources; Node 24 type stripping — erasable syntax
-   only): config validation, baseline fold, revision mechanics, drift/decision
+1. Unit (node:test on TS sources; Node >=22.18 type stripping, also verified
+   on Node 24 — erasable syntax only): config validation, baseline fold, revision mechanics, drift/decision
    pairing, manual `/align`, old-session compatibility, unrelated-question
    isolation, policy rendering (off/manual/auto, baseline summary), both
    tools (silent record, question flow, child escalation, cancellation), and

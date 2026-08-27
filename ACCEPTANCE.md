@@ -1,3 +1,37 @@
+# Acceptance report — dsh-requirements-alignment v0.4.2
+
+Date: 2026-08-23 · release recheck: 2026-08-27 · package 0.4.2 · DSH 0.1.1-rc.2 · workspace: `<local-workspace>`
+
+v0.4.2 is a bounded compatibility and Web client-graph correction. It does
+not change the product architecture: requirement state and session-mode state
+remain independent sidecars; mode changes remain one source+capability
+transaction; the plugin still requires no DSH Core patch.
+
+## v0.4.2 checklist
+
+| # | Criterion | Status | Evidence |
+|---|---|---|---|
+| 1 | CRLF noise separated from semantic work | ✅ | Baseline: 101 tracked files = 1 binary, 22 CRLF-only, 77 LF-only, 1 mixed (`package.json`); `git diff --ignore-cr-at-eol` was empty and the initial worktree was clean. `.gitattributes` now establishes canonical LF without normalizing binary formats. |
+| 2 | Correct package-level client graph | ✅ | Live rc.1/rc.2 package manifests show runtime + locale client entries; `dsh-client-ui-slots` has neither `dsh.client` nor `./client`. Package inject is exactly runtime + locale; browser service inject remains `slots` + `locale`. |
+| 3 | Client manifest regression | ✅ | 3 tests assert the exact package graph, forbid `dsh-client-ui-slots`, and bind source + built client to exactly one `shell.overlay` registration. |
+| 4 | Entire relevant DSH family runs at rc.2 | ✅ | Registry availability checked before editing; package + lock + workspace + isolated profile all use `0.1.1-rc.2`. Packed smoke asserts eight physical runtime packages before boot. |
+| 5 | P0 source/capability transaction remains atomic | ✅ | Full Manual/Auto rollback, partial cleanup, fresh-disposer rollback, double-failure degradation/recovery, source compensation, presence semantics, compensation-write recovery, and stable-state equality tests pass. |
+| 6 | Real rc.2 persistence/migration parity | ✅ | Fixtures are produced and reloaded by the physical rc.2 writer/reader. Header, packed rows, end seed, official event vocabulary, cold resume, fork `parentSession`/`seedLength`, and non-target bytes are preserved; production emits zero `alignment/*`. |
+| 7 | Capsule race and security contracts | ✅ | Real-hooks A→B, A→none, mutation-in-flight, and A→B→C tests pass; no `sessionId=undefined`. Loopback/Host/Origin/CSRF/sessionId guards pass in unit and live server checks. |
+| 8 | Real browser DSH Web E2E | ✅ | Real rc.2 Web on loopback: root 200, packed client 200, capsule visible and expandable, Auto→Manual reflected as session source and persisted in the sidecar, reset returns to Auto with zero overrides, reload leaves exactly one capsule and no console warnings/errors. |
+| 9 | Node baseline | ✅ | `engines.node >=22.18.0`; Windows/Ubuntu CI matrix covers Node 22.18 + 24. Local Node 24.18.1 check and Node 22.23.2 full tests pass. |
+| 10 | Full source gate | ✅ | Frozen install passes; both tsconfigs, lint, build, and **236/236** Node tests pass (0 fail/skip/todo). |
+| 11 | Packed artifact lifecycle | ✅ | Current 0.4.2 tarball: isolated add, compose, Auto/Manual/Off real rc.2 boot, `/align`, `/align-mode`, live switching, remove, and no leftover rows/package: **64/64**. |
+| 12 | External model completion | ⚠️ NOT RUN | The earlier acceptance environment returned `QUOTA: Insufficient Balance`; the fresh release-day rerun intentionally used a credential-free disposable `DSH_HOME` and returned `MISSING_CREDENTIAL`. Neither result is counted as model E2E, and no credential was read or copied into the test environment. |
+
+Release-gate result: **PASS WITH LIMITATION** — the code, packed runtime, and
+real browser gates pass; only model-dependent completion is unexecuted, and an
+unrelated pre-existing `@eslint/js@10` / ESLint 9 development peer warning
+remains. This report records the pre-publication gates; registry, tag, Release,
+and remote CI truth are verified independently during publication.
+
+---
+
 # Acceptance report — dsh-requirements-alignment v0.4.1
 
 Date: 2026-08-21 · package 0.4.1 · DSH 0.1.1-rc.1 · workspace: `<local-workspace>`

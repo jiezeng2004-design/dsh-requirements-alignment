@@ -314,7 +314,7 @@ test('client: apply registers shell.overlay exactly once per load and returns a 
 
 // -------------------------------------------- slot lifecycle contract (runtime-ish)
 
-/** A minimal fake slot registry honoring the rc.1 register/dispose contract. */
+/** A minimal fake slot registry honoring the rc.2 register/dispose contract. */
 function fakeSlotRegistry() {
   const occupants: Array<{ opts: Record<string, unknown>; comp: unknown }> = [];
   return {

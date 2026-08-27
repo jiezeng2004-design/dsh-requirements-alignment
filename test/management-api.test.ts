@@ -113,7 +113,7 @@ function captureWebServer() {
 function makeRequest(
     method: string,
     url: string,
-    options: { host?: string; origin?: string; header?: string; body?: unknown } = {}
+    options: { host?: string; origin?: string; header?: string; body?: unknown; remoteAddress?: string } = {}
 ): IncomingMessage {
     // `header` is omitted by default (every mutation looks authorized); pass
     // `header: undefined` explicitly to simulate a request WITHOUT the CSRF
@@ -127,7 +127,7 @@ function makeRequest(
             origin: options.origin ?? 'http://127.0.0.1:3080',
             [MUTATION_HEADER]: header
         },
-        socket: { remoteAddress: '127.0.0.1' }
+        socket: { remoteAddress: options.remoteAddress ?? '127.0.0.1' }
     } as unknown as IncomingMessage;
     if (options.body !== undefined) {
         (req as unknown as { body?: string }).body = JSON.stringify(options.body);
@@ -269,6 +269,47 @@ test('management-api: PUT /shared-mode persists through setMode and returns the 
     assert.equal((body() as { snapshot: { effectiveMode: string } }).snapshot.effectiveMode, 'manual');
 });
 
+test('management-api: IPv6 loopback Host + Origin + remote completes a mutation happy path', async () => {
+    const controller = fakeController();
+    const api = createManagementApi(controller as never);
+    const { res, statusCode, body } = makeResponse();
+    await dispatch(api, makeRequest('PUT', ROUTE_BASE + '/mode?sessionId=ipv6-session', {
+        host: '[::1]:3080',
+        origin: 'http://[::1]:3080',
+        header: '1',
+        remoteAddress: '::1',
+        body: { mode: 'manual' }
+    }), res);
+    assert.equal(statusCode(), 200);
+    assert.equal(controller.calls.includes('setSessionMode:ipv6-session:manual'), true);
+    const payload = body() as AlignmentStatusPayload;
+    assert.equal(payload.session.id, 'ipv6-session');
+    assert.equal(payload.session.effectiveMode, 'manual');
+    assert.equal(payload.session.effectiveSource, 'session');
+});
+
+test('management-api: exact loopback Host representations remain accepted', async () => {
+    const cases = [
+        { host: '127.0.0.1', origin: 'http://127.0.0.1' },
+        { host: 'localhost:3080', origin: 'http://localhost:3080' },
+        { host: '::1', origin: 'http://[::1]' },
+        { host: '[::1]', origin: 'http://[::1]' },
+        { host: '[::1]:3080', origin: 'http://[::1]:3080' }
+    ];
+    for (const [index, item] of cases.entries()) {
+        const controller = fakeController();
+        const api = createManagementApi(controller as never);
+        const { res, statusCode } = makeResponse();
+        await dispatch(api, makeRequest('PUT', ROUTE_BASE + '/shared-mode', {
+            ...item,
+            remoteAddress: index < 2 ? '127.0.0.1' : '::1',
+            body: { mode: 'manual' }
+        }), res);
+        assert.equal(statusCode(), 200, item.host);
+        assert.equal(controller.calls.includes('setMode:manual'), true, item.host);
+    }
+});
+
 test('management-api: DELETE /shared-mode resets the shared override', async () => {
     const controller = fakeController();
     controller.sharedOverrideRecord.mode = 'manual';
@@ -289,36 +330,70 @@ test('management-api: an invalid mode is rejected with a 400 and no write', asyn
     assert.equal(controller.calls.includes('setMode:nonsense'), false);
 });
 
-test('management-api: a mutation without the CSRF header is rejected', async () => {
-    const controller = fakeController();
-    const api = createManagementApi(controller as never);
-    const { res, statusCode } = makeResponse();
-    await dispatch(api, makeRequest('PUT', ROUTE_BASE + '/shared-mode', { body: { mode: 'manual' }, header: undefined }), res);
-    assert.equal(statusCode(), 403);
-    assert.equal(controller.calls.includes('setMode:manual'), false);
+test('management-api: missing and invalid CSRF mutation headers are rejected', async () => {
+    for (const header of [undefined, '0', 'true']) {
+        const controller = fakeController();
+        const api = createManagementApi(controller as never);
+        const { res, statusCode } = makeResponse();
+        await dispatch(api, makeRequest('PUT', ROUTE_BASE + '/shared-mode', { body: { mode: 'manual' }, header }), res);
+        assert.equal(statusCode(), 403, String(header));
+        assert.equal(controller.calls.includes('setMode:manual'), false, String(header));
+    }
 });
 
-test('management-api: a mutation from a non-loopback origin is rejected', async () => {
-    const controller = fakeController();
-    const api = createManagementApi(controller as never);
-    const { res, statusCode } = makeResponse();
-    await dispatch(api, makeRequest('PUT', ROUTE_BASE + '/shared-mode', {
-        body: { mode: 'manual' },
-        origin: 'http://evil.example.com'
-    }), res);
-    assert.equal(statusCode(), 403);
-    assert.equal(controller.calls.includes('setMode:manual'), false);
+test('management-api: wildcard, external IPv6, and spoofed origins are rejected', async () => {
+    for (const origin of [
+        'http://0.0.0.0:3080',
+        'http://203.0.113.9:3080',
+        'http://[::]:3080',
+        'http://[2001:db8::1]:3080',
+        'http://localhost.evil.example:3080'
+    ]) {
+        const controller = fakeController();
+        const api = createManagementApi(controller as never);
+        const { res, statusCode } = makeResponse();
+        await dispatch(api, makeRequest('PUT', ROUTE_BASE + '/shared-mode', {
+            body: { mode: 'manual' },
+            origin
+        }), res);
+        assert.equal(statusCode(), 403, origin);
+        assert.equal(controller.calls.includes('setMode:manual'), false, origin);
+    }
 });
 
-test('management-api: a mutation from a non-loopback remote is rejected', async () => {
-    const controller = fakeController();
-    const api = createManagementApi(controller as never);
-    const { res, statusCode } = makeResponse();
-    const req = makeRequest('PUT', ROUTE_BASE + '/shared-mode', { body: { mode: 'manual' } });
-    (req.socket as { remoteAddress: string }).remoteAddress = '203.0.113.9';
-    await dispatch(api, req, res);
-    assert.equal(statusCode(), 403);
-    assert.equal(controller.calls.includes('setMode:manual'), false);
+test('management-api: wildcard and external remote addresses are rejected', async () => {
+    for (const remoteAddress of ['0.0.0.0', '::', '203.0.113.9', '2001:db8::1']) {
+        const controller = fakeController();
+        const api = createManagementApi(controller as never);
+        const { res, statusCode } = makeResponse();
+        const req = makeRequest('PUT', ROUTE_BASE + '/shared-mode', {
+            body: { mode: 'manual' },
+            remoteAddress
+        });
+        await dispatch(api, req, res);
+        assert.equal(statusCode(), 403, remoteAddress);
+        assert.equal(controller.calls.includes('setMode:manual'), false, remoteAddress);
+    }
+});
+
+test('management-api: wildcard, external IPv6, and spoofed Host headers are rejected', async () => {
+    for (const host of [
+        '0.0.0.0:3080',
+        '203.0.113.9:3080',
+        '[::]:3080',
+        '[2001:db8::1]:3080',
+        'localhost.evil.example:3080'
+    ]) {
+        const controller = fakeController();
+        const api = createManagementApi(controller as never);
+        const { res, statusCode } = makeResponse();
+        await dispatch(api, makeRequest('PUT', ROUTE_BASE + '/shared-mode', {
+            body: { mode: 'manual' },
+            host
+        }), res);
+        assert.equal(statusCode(), 403, host);
+        assert.equal(controller.calls.includes('setMode:manual'), false, host);
+    }
 });
 
 test('management-api: unknown route returns 404', async () => {

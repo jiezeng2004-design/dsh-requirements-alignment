@@ -1,5 +1,13 @@
-# Line-ending policy: .gitignore must always check out with LF. A ZIP copy of
-# the working tree must never carry CRLF here (git then reports it as MM on
-# machines without core.autocrlf). Other text files keep the host default.
-*.gitignore text eol=lf
-.gitattributes text eol=lf
+# Repository text is canonical LF on every platform. `text=auto` keeps binary
+# payloads byte-exact; the explicit binary patterns protect present and future
+# migration/session artifacts from accidental normalization.
+* text=auto eol=lf
+
+*.png binary
+*.zip binary
+*.tgz binary
+*.gz binary
+*.zst binary
+*.zstd binary
+*.wasm binary
+*.bin binary

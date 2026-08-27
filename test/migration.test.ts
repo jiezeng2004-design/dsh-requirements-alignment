@@ -443,18 +443,18 @@ test('migration: a second run is an idempotent no-op and leaves the artifact byt
     }
 });
 
-// ── real rc.1 writer parity: the fixture is produced by the REAL backend ────
+// ── real rc.2 writer parity: the fixture is produced by the REAL backend ────
 
 /**
- * Build a real DSH `0.1.1-rc.1` writer-produced artifact for a session with
+ * Build a real DSH `0.1.1-rc.2` writer-produced artifact for a session with
  * the FULL modern vocabulary — header, user/message, assistant/chunk (which
  * packs into `text-chunks`/`tool-call-chunks` rows on materialization),
  * assistant/message, tool call + result, and `turn/start`/`turn/end` — plus
  * the legacy `alignment/*` events appended through the SAME real
- * `Session.append` (the rc.1 writer accepts unknown event types). This is
+ * `Session.append` (the rc.2 writer accepts unknown event types). This is
  * byte-truthful: the artifact on disk is produced by the real backend we
  * ship against, so the migration parity gate exercises exactly the physical
- * format rc.1 writes, not a local mirror.
+ * format rc.2 writes, not a local mirror.
  */
 async function writeRealWriterArtifact(root: string, id: string): Promise<{ session: Session; ctx: Context }> {
     const ctx = new Context();
@@ -466,7 +466,7 @@ async function writeRealWriterArtifact(root: string, id: string): Promise<{ sess
 
     // A fresh (non-seeded) session: the constructor writes NO end-seed marker.
     // Turn 1: user message, assistant chunks (packed), assistant message,
-    // tool call + result, with realistic rc.1 message shapes.
+    // tool call + result, with realistic rc.2 message shapes.
     appendReal(session, 'turn/start', { turn: 1 });
     appendReal(session, 'user/message', {
         id: 'm-1',
@@ -501,7 +501,7 @@ async function writeRealWriterArtifact(root: string, id: string): Promise<{ sess
     appendReal(session, 'turn/end', { turn: 1, reason: { kind: 'completed' } });
 
     // The legacy alignment events — the pre-fix writer's private vocabulary,
-    // appended through the very same real writer (rc.1 accepts unknown types;
+    // appended through the very same real writer (rc.2 accepts unknown types;
     // the reader refuses them until migration marks them ignorable).
     appendLegacyReal(session, 'alignment/baseline', { baseline: { revision: 1, goal: 'v1', updatedAt: 1700000000100 } });
     appendLegacyReal(session, 'alignment/drift', { reason: 'scope-expansion', description: 'd1', at: 1700000000200 });
@@ -518,7 +518,7 @@ function appendReal(session: Session, type: SessionEventType, data: unknown, opt
     session.append(type, data as never, opts as never);
 }
 
-/** Append a legacy alignment event through the real writer (unknown type to rc.1). */
+/** Append a legacy alignment event through the real writer (unknown type to rc.2). */
 function appendLegacyReal(session: Session, type: string, data: unknown): SessionEvent {
     return session.append(type as SessionEventType, data as never);
 }
@@ -532,13 +532,13 @@ async function disposeCtx(ctx: Context): Promise<void> {
     await fiber?.dispose().catch(() => { });
 }
 
-// ── Test M: real rc.1 writer -> legacy alignment events -> migrate -> real reader loads ──
+// ── Test M: real rc.2 writer -> legacy alignment events -> migrate -> real reader loads ──
 
-test('migration M: a REAL rc.1 writer-produced artifact with legacy alignment events migrates and reloads through the REAL rc.1 reader', async () => {
+test('migration M: a REAL rc.2 writer-produced artifact with legacy alignment events migrates and reloads through the REAL rc.2 reader', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-real-'));
     const storagesRoot = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-real-store-'));
     try {
-        // Phase 1: the real rc.1 writer produces the artifact (with legacy
+        // Phase 1: the real rc.2 writer produces the artifact (with legacy
         // alignment events inside — the pre-fix scenario).
         const writer = await writeRealWriterArtifact(root, 's-real');
         try {
@@ -559,7 +559,7 @@ test('migration M: a REAL rc.1 writer-produced artifact with legacy alignment ev
             await assert.rejects(
                 bare0.ctx.sessionPersistence.load(SessionId('s-real')),
                 /alignment\/baseline/,
-                'the real rc.1 reader must refuse the legacy artifact before migration'
+                'the real rc.2 reader must refuse the legacy artifact before migration'
             );
         } finally {
             await bare0.dispose();
@@ -581,7 +581,7 @@ test('migration M: a REAL rc.1 writer-produced artifact with legacy alignment ev
             assert.equal(report.originalSha256.length, 64);
             assert.ok(report.backupPath);
 
-            // The REAL rc.1 reader loads the migrated artifact and the full
+            // The REAL rc.2 reader loads the migrated artifact and the full
             // event vocabulary is intact (seqs contiguous, header correct,
             // packed rows readable, import folds correctly).
             const prepared = await harness.ctx.sessionPersistence.prepare(SessionId('s-real'));
@@ -652,9 +652,9 @@ test('migration M: a REAL rc.1 writer-produced artifact with legacy alignment ev
     }
 });
 
-// ── Test N: real rc.1 writer -> fork metadata + session/end-seed survival ───
+// ── Test N: real rc.2 writer -> fork metadata + session/end-seed survival ───
 
-test('migration N: a real rc.1 fork session (parentSession + seedLength) migrates and resumes with lineage intact', async () => {
+test('migration N: a real rc.2 fork session (parentSession + seedLength) migrates and resumes with lineage intact', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-fork-'));
     const storagesRoot = await mkdtemp(join(tmpdir(), 'dsh-alignment-migrate-fork-store-'));
     try {

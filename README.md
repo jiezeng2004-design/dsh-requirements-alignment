@@ -284,6 +284,13 @@ The packed-artifact smoke packs the current tarball, installs it into a disposab
 powershell -File scripts/packed-smoke.ps1
 ```
 
+The current v0.4.2 gate uses DeepSeek Harness `0.1.1-rc.2` throughout. The
+package-level Web client graph injects only the two packages that provide
+actual client entries (`dsh-client-runtime` and `dsh-client-locale`); the
+browser module separately injects the Cordis services `slots` and `locale`.
+`dsh-client-ui-slots` is therefore neither bundled nor requested as a client
+graph node, while the `shell.overlay` behavior is unchanged.
+
 The v0.2.1 release gate verified:
 
 - Core modifications: **0**
@@ -373,12 +380,42 @@ The v0.4.1 Web capsule + DSH rc.1 compatibility gate verified:
   rebuilt bundle + loopback management API guard contract were verified live
   against the running DSH Web `0.1.1-rc.1`.
 
-Detailed evidence and the bounded-run caveat are recorded in `ACCEPTANCE.md`.
+The v0.4.2 DSH rc.2 + client-graph gate verified:
+
+- Core modifications: **0**; package version is `0.4.2`.
+- Node tests: **236/236 passing**, 0 fail/skip/todo, on local Node 24.18.1;
+  the same full suite passes on Node 22.23.2. CI covers Windows + Ubuntu on
+  Node 22.18 and Node 24.
+- Client manifest: package inject is exactly `dsh-client-runtime` +
+  `dsh-client-locale`; `test/client-manifest.test.ts` prevents the pure/core
+  `dsh-client-ui-slots` package from returning and ties source + built bundle
+  to one `shell.overlay` occupant using the `slots` + `locale` services.
+- DSH family: all relevant direct/peer/dev/lock/dogfood versions resolve to
+  the real `0.1.1-rc.2` packages. The packed smoke checks the physical dsh
+  launcher, headless/base core, commands, session, storage, storage-domain,
+  and settings versions before boot and fails on any drift.
+- Real rc.2 writer/reader migration fixtures preserve the official event
+  vocabulary, header, packed rows, end seed, cold resume, and fork lineage;
+  production still appends zero `alignment/*` events.
+- Packed artifact: **64/64 deterministic checks passing** for isolated
+  add/compose/Auto+Manual+Off boots/`/align`/`/align-mode`/hot switching/remove,
+  with no leftover package or config row.
+- Real browser: DSH Web rc.2 served the packed client; the capsule was visibly
+  rendered, expanded, changed one session Auto -> Manual through the live
+  management backend, reset to zero persisted overrides, and remained exactly
+  one instance after reload with no browser warnings/errors.
+- External model completion was unavailable: the acceptance environment
+  returned `QUOTA: Insufficient Balance`, while the credential-free release
+  recheck returned `MISSING_CREDENTIAL`. Model-dependent E2E is **NOT RUN** and
+  is not included in the green deterministic result.
+
+Detailed evidence and the bounded-run caveat are recorded in the
+[repository acceptance report](https://github.com/jiezeng2004-design/dsh-requirements-alignment/blob/main/ACCEPTANCE.md).
 
 ## Development
 
 ```powershell
-pnpm install          # dependencies
+pnpm install          # dependencies (Node >=22.18.0; Node 24 also verified)
 pnpm run typecheck    # tsc (src + test)
 pnpm run lint         # eslint (src + test)
 pnpm run build        # tsc → lib/
@@ -401,11 +438,13 @@ See `docs/ARCHITECTURE.md` for the design decisions and the exact capability sea
 
 ## Compatibility
 
-- DeepSeek Harness `0.1.1-rc.1` (verified against the npm registry releases and
-  a real rc.1 DSH installation through the packed-artifact add/boot/remove
-  smoke; migration parity is byte-for-byte with the rc.1 writer/reader).
-- `@deepseek-ai/cordis` 4.x, `@deepseek-ai/dsh-*` `0.1.1-rc.1` (exact pins, no
+- DeepSeek Harness `0.1.1-rc.2` (verified against the npm registry releases and
+  a real rc.2 DSH installation through the packed-artifact add/boot/remove
+  smoke; migration parity is byte-for-byte with the rc.2 writer/reader).
+- `@deepseek-ai/cordis` 4.x, `@deepseek-ai/dsh-*` `0.1.1-rc.2` (exact pins, no
   prerelease range drift).
+- Node `>=22.18.0`. Development/test gates pass on Node 22.23 and 24.18; CI
+  pins the lower supported line at Node 22.18 and also runs Node 24.
 - Windows (verified) and POSIX (no platform-specific code).
 - Old v0.1 sessions fold safely: legacy `alignment/status` events still count as manual checks, and a session without the new events simply reports revision 0 / "unknown" instead of crashing.
 

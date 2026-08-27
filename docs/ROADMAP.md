@@ -3,15 +3,18 @@
 This roadmap records intended product direction; it is not a claim that the
 listed behavior ships in the current package.
 
-## v0.4.1 — session-scoped mode selector + Web capsule
+## v0.4.2 — rc.2 compatibility + Web client graph hardening
 
 > **Status: implemented in the current package.** The four-layer resolution,
 > the `/align-mode session` command surface, per-session persistence (the
 > `SessionModeStore` sidecar), fork inheritance, and the per-agent capability
 > model are shipped, and v0.4.1 adds the `AlignmentCapsule` Web float driven by
 > the plugin's loopback management API. The package also folds DSH
-> `0.1.1-rc.1` compatibility (dependencies pinned to the rc.1 family, migration
-> parity with the real rc.1 writer/reader). The native Web session-local
+> `0.1.1-rc.2` compatibility (dependencies pinned to the rc.2 family, migration
+> parity with the real rc.2 writer/reader). v0.4.2 also removes the pure/core
+> `dsh-client-ui-slots` package from the package-level client graph while
+> retaining the browser `slots` service injection, and adds a manifest
+> regression gate. The native Web session-local
 > selector below remains a host-UI option, not a DSH Core patch; see
 > `docs/ARCHITECTURE.md`.
 

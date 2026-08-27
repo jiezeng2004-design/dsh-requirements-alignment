@@ -55,17 +55,27 @@ function isLoopbackRemote(req: IncomingMessage): boolean {
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+    const lower = hostname.toLowerCase();
+    const normalized = lower.startsWith('[') && lower.endsWith(']')
+        ? lower.slice(1, -1)
+        : lower;
+    return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1';
+}
+
 function hostAllowed(host: string | undefined): boolean {
     if (host === undefined || host === '') return false;
-    const normalized = host.toLowerCase().replace(/\[([^\]]+)\]/g, '$1').replace(/:\d+$/, '');
-    return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1';
+    if (isLoopbackHostname(host)) return true;
+    const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(host);
+    if (bracketed !== null) return isLoopbackHostname(bracketed[1]!);
+    const hostnameWithOptionalPort = /^([^:]+)(?::\d+)?$/.exec(host);
+    return hostnameWithOptionalPort !== null && isLoopbackHostname(hostnameWithOptionalPort[1]!);
 }
 
 function originAllowed(origin: string | undefined): boolean {
     if (origin === undefined || origin === '') return false;
     try {
-        const host = new URL(origin).hostname.toLowerCase();
-        return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+        return isLoopbackHostname(new URL(origin).hostname);
     } catch {
         return false;
     }

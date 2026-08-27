@@ -2,6 +2,67 @@
 
 All notable changes to this project are documented here.
 
+## 0.4.2 - DSH 0.1.1-rc.2 compatibility and Web client graph fix
+
+### Fixed
+
+- Removed `@deepseek-ai/dsh-client-ui-slots` from package-level
+  `dsh.client.inject`. The rc.2 package has no client entry and contributes no
+  client-graph node; it is a core slot registry/library. The browser bundle's
+  Cordis service injection remains `['slots', 'locale']` and the capsule still
+  registers one `shell.overlay` occupant.
+- Added `test/client-manifest.test.ts` to keep the package graph, source
+  service contract, and built client registration aligned, and to prevent the
+  pure/core slots package from returning to the client manifest.
+- Made LF the repository's canonical text representation with
+  `* text=auto eol=lf`, while explicitly protecting PNG, archive, compressed,
+  Wasm, and binary fixtures from normalization.
+- Hardened the documented Windows PowerShell packed-smoke entry: expected
+  pre-model `QUOTA` and `MISSING_CREDENTIAL` stderr are captured for honest NOT
+  RUN classification, and cleanup uses an already-validated extended path on
+  Windows PowerShell 5 so deep pnpm trees are removed instead of failing at the
+  final step.
+
+### Changed
+
+- Upgraded every direct, peer, development, lockfile, workspace-policy, and
+  dogfood DSH family reference used by this plugin to the published
+  `0.1.1-rc.2` family. Packed smoke now fails before boot unless the isolated
+  launcher, headless/base core, commands, session, storage, storage-domain,
+  and settings packages all resolve to exactly rc.2.
+- Declared Node `>=22.18.0` and expanded CI to Windows + Ubuntu on Node 22.18
+  and Node 24. Both local Node 24 and Node 22.23 test runs pass the same
+  233-test suite.
+- Prepared package version `0.4.2` for GitHub and npm publication after the
+  deterministic and browser gates pass.
+
+### Verification
+
+- Typecheck (both tsconfigs), lint, build, and Node tests: **236/236 passing**,
+  0 fail, 0 skipped, 0 todo.
+- Real rc.2 writer/reader migration parity, fork lineage, cold resume,
+  capability rollback, source compensation, stale-session races, and
+  management API guards all pass.
+- Current-tarball isolated add/compose/Auto/Manual/Off boot/mode-switch/remove:
+  **64/64 deterministic checks passing**, with zero plugin rows or installed
+  package left after removal.
+- Real DSH Web rc.2 browser E2E passes: HTTP and client bundle served, the
+  capsule is pixel-visible, expands, switches a session Auto -> Manual using
+  the live management backend, resets cleanly, and remains a single instance
+  after reload with no browser console warnings/errors.
+
+### Known limitations
+
+- External model completion was unavailable: the earlier acceptance run reached
+  the provider but returned `QUOTA: Insufficient Balance`; the fresh release-day
+  rerun used a deliberately credential-free disposable `DSH_HOME` and returned
+  `MISSING_CREDENTIAL`. All deterministic/pre-model gates passed; model-dependent
+  E2E is **NOT RUN**, not counted as green.
+- The existing development-tool graph reports an unrelated peer warning:
+  `@eslint/js@10` expects ESLint 10 while this repository still runs ESLint 9.
+  The release checks themselves pass; changing the lint major is intentionally
+  outside this compatibility fix.
+
 ## 0.4.1 - Web floating capsule + DSH 0.1.1-rc.1 compatibility
 
 The plugin now ships a client half for DSH Web — the floating manager the user
