@@ -8,6 +8,8 @@
 
 **You decide the direction. The agent decides the engineering.**
 
+Current package: **v0.4.2**, targeting DeepSeek Harness **0.1.1-rc.2**. Requires Node.js **>=22.18.0**.
+
 ## The problem
 
 Long-running coding agents are good at keeping momentum. That is also how they can drift.
