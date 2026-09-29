@@ -51,6 +51,8 @@ export interface ModeSnapshot {
 
 /** What the persistence layer reports for one read. */
 export interface ModeStoreRead {
+    /** Modern profile configurations expose the inherited base separately. */
+    defaultMode?: unknown;
     /** The mode value as stored/resolved, unvalidated (may be junk). */
     resolvedMode: unknown;
     /** Whether the raw user layer currently holds a `mode` field. */
@@ -152,9 +154,10 @@ export class ModeStore {
                 this.scheduleInvalidRepair(read.resolvedMode);
             }
         }
-        const effectiveMode = overrideMode ?? this.defaultMode;
+        const defaultMode = isAlignmentMode(read.defaultMode) ? read.defaultMode : this.defaultMode;
+        const effectiveMode = overrideMode ?? defaultMode;
         return {
-            defaultMode: this.defaultMode,
+            defaultMode,
             ...(overrideMode === undefined ? {} : { overrideMode }),
             effectiveMode,
             effectiveSource: overrideMode === undefined ? 'profile' : 'override'

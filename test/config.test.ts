@@ -20,7 +20,7 @@ interface ShippedUnionNode {
 
 /** Apply the shipped Config schema (the same object Cordis uses at load). */
 function applySchema(input?: unknown) {
-    return ConfigSchema(input as never);
+    return resolveConfig(ConfigSchema(input as never));
 }
 
 function schemaAccepts(input: unknown): boolean {

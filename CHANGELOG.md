@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## 0.5.0-rc.1 - DSH 0.1.7-rc.2 release candidate
+
+- Pin the supported host family to 0.1.7-rc.2 and align Cordis, Cosmokit,
+  Schemastery and ESLint development peers.
+- Adopt durable sidecars in the awaited serial agent/created lifecycle;
+  declare the plugin's own requirements-alignment message source.
+- Replace retired SettingsProvider registration with owning-entry
+  SettingsForms/ConfigEditor mutations. Shared runtimeMode is independent of
+  the profile mode default; null resets it without erasing other settings.
+- Update the browser dependency graph to ui-layout + ui-session + locale.
+- Add modern settings regressions and host-service integration to pnpm check
+  and the existing Windows/Linux, Node 22.18/24 CI matrix. Legacy storage
+  fixtures are retained but explicitly excluded on the incompatible host API.
+- Keep legacy migration fail-closed on immutable-generation hosts. This is
+  not a legacy session/settings migration implementation.
+- Live browser capsule interactions and external-model completion were not
+  verified for this release candidate; the packed CLI/Web HTTP path was.
+
 ## 0.4.2 - DSH 0.1.1-rc.2 compatibility and Web client graph fix
 
 ### Fixed

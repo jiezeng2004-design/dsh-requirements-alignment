@@ -15,6 +15,7 @@ import { createScope, scopeOf } from '@deepseek-ai/dsh-scope';
 import { agentEvents } from '@deepseek-ai/dsh-agent';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { SessionId, SessionHeader } from '@deepseek-ai/dsh-session';
+import { Session } from '@deepseek-ai/dsh-session';
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
 import type { PromptSection, AssembleContext, AssembledSection, PromptAssembly } from '@deepseek-ai/dsh-system-prompt';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -210,13 +211,9 @@ export function scopedAgentContext(rootCtx: Context, key: object): { ctx: Contex
 }
 
 /** Emit `agent/session-start` through the fused agent dispatcher (scope-carrier correct). */
-export function emitSessionStart(ctx: Context, agent: Agent, source: string = 'startup'): void {
-    agentEvents(ctx, agent).emit('agent/session-start', { source } as never);
-}
-
 /** Emit `agent/created` through the fused agent dispatcher. */
-export function emitAgentCreated(ctx: Context, agent: Agent): void {
-    agentEvents(ctx, agent).emit('agent/created', { agent } as never);
+export async function emitAgentCreated(ctx: Context, agent: Agent): Promise<void> {
+    await agentEvents(ctx, agent).serial('agent/created', { source: 'startup' });
 }
 
 /** Emit `agent/disposed` through the fused agent dispatcher. */
@@ -264,7 +261,7 @@ export function fakeSession(events: readonly SessionEvent[] = [], options: FakeS
     const list: SessionEvent[] = [...events];
     const id = (options.id ?? `session-${Math.random().toString(36).slice(2, 10)}`) as SessionId;
     const header: SessionHeader = {
-        version: 0,
+        ...Session.create(id).header,
         id,
         createdAt: options.createdAt ?? 1000,
         ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
@@ -548,8 +545,7 @@ export async function mountAgent(
     h.agents.register(agent);
     // `agent/created` registers the agent's capabilities (the controller syncs
     // there); `agent/session-start` adopts the durable sidecars.
-    emitAgentCreated(h.ctx, agent);
-    emitSessionStart(h.ctx, agent);
+    await emitAgentCreated(h.ctx, agent);
     await new Promise((resolve) => setTimeout(resolve, 10));
     return { agent, session, scope };
 }

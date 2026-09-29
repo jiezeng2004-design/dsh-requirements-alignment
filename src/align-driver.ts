@@ -18,12 +18,25 @@
  */
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { CallId } from '@deepseek-ai/dsh-llm';
+import { sessionEvents } from './session-events.ts';
+import * as llm from '@deepseek-ai/dsh-llm';
+import type { ToolExecutionInput } from '@deepseek-ai/dsh-tools';
 import { assembleContextFor } from '@deepseek-ai/dsh-agent';
 import { POLICY_SECTION } from './policy.ts';
 import { foldAlignmentStatus } from './status.ts';
 import type { AlignmentStateStore } from './alignment-state-store.ts';
 import type { AlignmentStatus } from './types.ts';
+
+/** The tool-call brand was renamed in DSH 0.1.2. */
+function CallId(value: string): ToolExecutionInput['callId'] {
+    const api = llm as unknown as {
+        ToolCallId?: (value: string) => ToolExecutionInput['callId'];
+        CallId?: (value: string) => ToolExecutionInput['callId'];
+    };
+    const brand = api.ToolCallId ?? api.CallId;
+    if (brand === undefined) throw new Error('DSH provides no supported tool-call ID constructor');
+    return brand(value);
+}
 
 /** Raw driver config. */
 export interface AlignDriverConfig {
@@ -190,7 +203,7 @@ function resolveStore(ctx: import('@deepseek-ai/cordis').Context): AlignmentStat
 
 /** The store view of one agent's alignment status (legacy fold fallback). */
 function statusOf(store: AlignmentStateStore | undefined, agent: import('@deepseek-ai/dsh-agent').Agent): AlignmentStatus {
-    return store !== undefined ? store.getStatus(agent.session) : foldAlignmentStatus(agent.session.events);
+    return store !== undefined ? store.getStatus(agent.session) : foldAlignmentStatus(sessionEvents(agent.session));
 }
 
 /**
@@ -257,7 +270,7 @@ async function recordAgentRegistrations(
 }
 
 /**
- * Mount the driver: at every `agent/session-start`, record an initial
+ * Mount the driver: at every serial `agent/created`, record an initial
  * snapshot; optionally inject the isolation probe; for top-level agents run
  * `/align` through the real commands registry; and record a snapshot at every
  * `turn/end` of every session.
@@ -278,7 +291,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
     const getStore = () => resolveStore(ctx);
     let topLevelAgent: import('@deepseek-ai/dsh-agent').Agent | undefined;
     let topLevelSwitched = false;
-    ctx.on('agent/session-start', async ({ agent }) => {
+    ctx.on('agent/created', async ({ agent }) => {
         record(resolved.recordPath, snapshot(statusOf(getStore(), agent), agent, 'start'));
         // Two-session isolation probe (dogfood 13): once a SUBAGENT session
         // appears, switch the recorded top-level agent to a session override
@@ -323,7 +336,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                 record(resolved.recordPath, {
                     phase: 'inject',
                     injected: true,
-                    toolCalls: agent.session.events.filter((event) => event.type === 'tool/call').length
+                    toolCalls: sessionEvents(agent.session).filter((event) => event.type === 'tool/call').length
                 });
             } catch (error) {
                 record(resolved.recordPath, { phase: 'inject', injected: false, error: String(error) });
@@ -342,7 +355,7 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: AlignD
                         executed: true,
                         resultKind: execution?.result.kind,
                         resultText: execution?.result.text,
-                        alignCommandRuns: agent.session.events.filter((event) => event.type === 'command/run' && event.data.name === 'align').length,
+                        alignCommandRuns: sessionEvents(agent.session).filter((event) => event.type === 'command/run' && event.data.name === 'align').length,
                         manualChecks: statusOf(getStore(), agent).manualChecks
                     });
                 } catch (error) {

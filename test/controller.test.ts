@@ -129,8 +129,7 @@ test('controller: /align handler records the check in the store, steers the chec
         assert.match(message.content[0]!.text, /Requirements Alignment check \(manual\)/);
         assert.match(message.content[0]!.text, /durable sidecar state/);
         assert.match(message.content[0]!.text, /Mode: Auto \(profile default\)/);
-        assert.equal(message.source.kind, 'plugin');
-        assert.equal(message.source.plugin, 'requirements-alignment');
+        assert.equal(message.source.kind, 'requirements-alignment');
         assert.equal(message.source.form, 'notice');
     } finally {
         await h.dispose();

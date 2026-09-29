@@ -18,6 +18,13 @@
  * while the page is visible (2s); the panel reflects the last snapshot. The
  * mutation endpoints carry the CSRF guard header.
  *
+ * The capsule is user-draggable: pressing and dragging the capsule button
+ * moves the whole floating container (clamped to the viewport), and the
+ * position is persisted in localStorage so it survives reloads and stays
+ * reachable across window resizes. A drag gesture is distinguished from a
+ * click by a small movement threshold, so clicking still expands/collapses
+ * the panel exactly as before.
+ *
  * Stale-session protection: the current session id is held in a ref and a
  * request generation counter is bumped on every session change. A polling
  * (or post-mutation) response is committed only when its generation and its
@@ -125,9 +132,10 @@ const en = {
 
 const CSS = `
 .dra-page{position:fixed;right:20px;bottom:20px;z-index:30;display:flex;flex-direction:column;align-items:flex-end;gap:8px;font-family:var(--ds-font-family-ui,inherit)}
-.dra-capsule{box-sizing:border-box;display:inline-flex;align-items:center;gap:8px;height:34px;padding:0 14px;border-radius:17px;border:1px solid var(--dsw-alias-border-l2,var(--dsw-alias-border-subtle,rgba(128,128,128,.35)));background:var(--dsw-alias-bg-layer-3,var(--dsw-alias-bg-module-platform,rgba(255,255,255,.92)));box-shadow:0 4px 16px rgba(0,0,0,.12);cursor:pointer;color:var(--dsw-alias-label-primary);transition:border-color .15s ease,box-shadow .15s ease}
+.dra-capsule{box-sizing:border-box;display:inline-flex;align-items:center;gap:8px;height:34px;padding:0 14px;border-radius:17px;border:1px solid var(--dsw-alias-border-l2,var(--dsw-alias-border-subtle,rgba(128,128,128,.35)));background:var(--dsw-alias-bg-layer-3,var(--dsw-alias-bg-module-platform,rgba(255,255,255,.92)));box-shadow:0 4px 16px rgba(0,0,0,.12);cursor:pointer;touch-action:none;color:var(--dsw-alias-label-primary);transition:border-color .15s ease,box-shadow .15s ease}
 .dra-capsule:hover{border-color:var(--dsw-alias-label-dimmed,rgba(128,128,128,.5));box-shadow:0 6px 20px rgba(0,0,0,.16)}
 .dra-capsule:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#6366f1);outline-offset:2px}
+.dra-page.dra-dragging .dra-capsule{cursor:grabbing}
 .dra-dot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:none}
 .dra-capsule-label{font-size:12.5px;line-height:20px;font-weight:600;letter-spacing:.2px}
 .dra-panel{box-sizing:border-box;width:300px;max-height:min(70vh,520px);overflow:auto;display:flex;flex-direction:column;gap:10px;padding:14px 14px 12px;border-radius:16px;border:1px solid var(--dsw-alias-border-l2,var(--dsw-alias-border-subtle,rgba(128,128,128,.22)));background:var(--dsw-alias-bg-layer-3,var(--dsw-alias-bg-module-platform,rgba(255,255,255,.97)));box-shadow:0 12px 36px rgba(0,0,0,.18);color:var(--dsw-alias-label-primary)}
@@ -216,6 +224,56 @@ function modeColor(mode) {
   return '#9ca3af';
 }
 
+// ------------------------------------------------------------------ dragging
+// The floating container is user-draggable. The drag math and the position
+// persistence are pure helpers (storage injected) so they are unit-testable
+// without a DOM; the component only wires them to pointer events.
+const CAPSULE_POS_KEY = 'dsh-requirements-alignment.capsule-pos';
+const DRAG_MARGIN = 8; // px kept between the container and the viewport edge
+const DRAG_THRESHOLD = 4; // px of movement that separates a drag from a click
+
+/** Clamp a top-left position so the given rect stays inside the viewport. */
+function clampPosition(pos, size, viewport) {
+  const maxLeft = Math.max(DRAG_MARGIN, viewport.width - size.width - DRAG_MARGIN);
+  const maxTop = Math.max(DRAG_MARGIN, viewport.height - size.height - DRAG_MARGIN);
+  return {
+    left: Math.min(Math.max(pos.left, DRAG_MARGIN), maxLeft),
+    top: Math.min(Math.max(pos.top, DRAG_MARGIN), maxTop),
+  };
+}
+
+/** Read the persisted capsule position; null when absent or corrupt. */
+function readCapsulePosition(storage) {
+  try {
+    const raw = storage.getItem(CAPSULE_POS_KEY);
+    if (typeof raw !== 'string' || raw === '') return null;
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object') return null;
+    if (!Number.isFinite(parsed.left) || !Number.isFinite(parsed.top)) return null;
+    return { left: parsed.left, top: parsed.top };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the capsule position; failures (private mode, quota) are ignored. */
+function writeCapsulePosition(storage, pos) {
+  try {
+    storage.setItem(CAPSULE_POS_KEY, JSON.stringify({ left: pos.left, top: pos.top }));
+  } catch {
+    // drag still works for this session; only persistence is lost
+  }
+}
+
+/** Move the container element to a clamped position (fixed left/top layout). */
+function applyCapsulePosition(el, pos, size, viewport) {
+  const clamped = clampPosition(pos, size, viewport);
+  el.style.left = clamped.left + 'px';
+  el.style.top = clamped.top + 'px';
+  el.style.right = 'auto';
+  el.style.bottom = 'auto';
+}
+
 // ------------------------------------------------------------------- capsule
 
 /**
@@ -248,6 +306,12 @@ function AlignmentCapsule(props) {
   // previous session is dropped, never rendered, so an old snapshot can never
   // overwrite a newer session's state.
   const requestVersionRef = React.useRef(0);
+  // Draggable capsule state: the floating container element (moved by drags),
+  // the in-flight pointer gesture (null when idle), and the swallow-one-click
+  // flag that distinguishes a drag from a plain click on the capsule button.
+  const containerRef = React.useRef(null);
+  const dragRef = React.useRef(null);
+  const suppressClickRef = React.useRef(false);
 
   const refresh = React.useCallback(async () => {
     const sessionId = currentSessionRef.current;
@@ -300,6 +364,117 @@ function AlignmentCapsule(props) {
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, [currentSessionId, refresh]);
+
+  // ------------------------------------------------------------ capsule drag
+  // Pointer gesture handlers attached to the capsule button (the drag handle).
+  // Pointer capture keeps the gesture alive outside the button, a movement
+  // threshold separates drag from click, and the click that follows a real
+  // drag is swallowed so the panel does not toggle.
+  const startDrag = (event) => {
+    if (event.button !== 0) return; // primary button only
+    if (dragRef.current !== null) return; // one gesture at a time
+    const el = containerRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originLeft: rect.left,
+      originTop: rect.top,
+      size: { width: rect.width, height: rect.height },
+      moved: false,
+    };
+    suppressClickRef.current = false;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // capture is best-effort; the gesture still works while over the button
+    }
+    event.preventDefault();
+  };
+
+  const moveDrag = (event) => {
+    const drag = dragRef.current;
+    if (drag === null || event.pointerId !== drag.pointerId) return;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (!drag.moved && Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return;
+    const el = containerRef.current;
+    if (!el) return;
+    drag.moved = true;
+    applyCapsulePosition(
+      el,
+      { left: drag.originLeft + dx, top: drag.originTop + dy },
+      drag.size,
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    el.dataset.draCustom = '1';
+    el.classList.add('dra-dragging');
+  };
+
+  const endDrag = (event) => {
+    const drag = dragRef.current;
+    if (drag === null || event.pointerId !== drag.pointerId) return;
+    dragRef.current = null;
+    try {
+      if (typeof event.currentTarget.hasPointerCapture === 'function' && event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // release is best-effort
+    }
+    const el = containerRef.current;
+    if (el) el.classList.remove('dra-dragging');
+    if (!drag.moved) return;
+    // A real drag: swallow the click that follows and persist the position.
+    suppressClickRef.current = true;
+    if (el !== null && typeof window !== 'undefined' && typeof window.localStorage !== 'undefined') {
+      const rect = el.getBoundingClientRect();
+      writeCapsulePosition(window.localStorage, { left: rect.left, top: rect.top });
+    }
+  };
+
+  const cancelDrag = (event) => {
+    const drag = dragRef.current;
+    if (drag === null || event.pointerId !== drag.pointerId) return;
+    dragRef.current = null;
+    const el = containerRef.current;
+    if (el) el.classList.remove('dra-dragging');
+    // A cancelled gesture never produces a click; suppressClickRef is untouched.
+  };
+
+  // Restore a persisted position once, and re-clamp it when the viewport
+  // changes so the capsule can never end up off-screen and unreachable.
+  React.useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof window === 'undefined') return;
+    if (typeof window.localStorage !== 'undefined') {
+      const stored = readCapsulePosition(window.localStorage);
+      if (stored !== null) {
+        applyCapsulePosition(
+          el,
+          stored,
+          { width: el.getBoundingClientRect().width, height: el.getBoundingClientRect().height },
+          { width: window.innerWidth, height: window.innerHeight },
+        );
+        el.dataset.draCustom = '1';
+      }
+    }
+    if (typeof window.addEventListener !== 'function') return;
+    const onResize = () => {
+      if (el.dataset.draCustom !== '1') return;
+      const rect = el.getBoundingClientRect();
+      applyCapsulePosition(
+        el,
+        { left: rect.left, top: rect.top },
+        { width: rect.width, height: rect.height },
+        { width: window.innerWidth, height: window.innerHeight },
+      );
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   // Render-time identity guard: only a snapshot whose session id matches the
   // CURRENT session may be displayed. Anything else (stale, from a previous
@@ -420,7 +595,17 @@ function AlignmentCapsule(props) {
       {
         type: 'button',
         className: 'dra-capsule',
-        onClick: () => setExpanded(!expanded),
+        onClick: () => {
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false;
+            return;
+          }
+          setExpanded(!expanded);
+        },
+        onPointerDown: startDrag,
+        onPointerMove: moveDrag,
+        onPointerUp: endDrag,
+        onPointerCancel: cancelDrag,
         'aria-label': expanded ? t('collapsed') : t('expanded'),
         'aria-expanded': expanded,
       },
@@ -524,7 +709,7 @@ function AlignmentCapsule(props) {
     children.push(React.createElement('div', { className: 'dra-panel', key: 'panel', role: 'region', 'aria-label': t('nav') }, ...panel));
   }
 
-  return React.createElement('div', { className: 'dra-page' }, ...children);
+  return React.createElement('div', { className: 'dra-page', ref: containerRef }, ...children);
 }
 
 module.exports = {
@@ -533,4 +718,7 @@ module.exports = {
   AlignmentCapsule,
   modeColor,
   dictionaries: { zh, en },
+  clampPosition,
+  readCapsulePosition,
+  writeCapsulePosition,
 };

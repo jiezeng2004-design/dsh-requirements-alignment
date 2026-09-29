@@ -1,4 +1,28 @@
-# Acceptance report — dsh-requirements-alignment v0.4.2
+# Local acceptance report — 0.5.0-rc.1 (2026-09-29)
+
+Target: DSH 0.1.7-rc.2, freshly verified npm latest. Local Node 24.18.1.
+
+| Evidence level | Result |
+|---|---|
+| TypeScript, lint, build | PASS |
+| Applicable unit/regression tests | 233/233 PASS; 15 historical storage fixtures excluded explicitly |
+| Real host service integration | PASS: lifecycle, tools/questions, fork, sidecar/JSONL persistence and migration refusal |
+| Packed real CLI/Web | PASS: isolated installation, authenticated root 200, validation 400, native shared-mode write, profile persistence, restart/reset |
+| Process cleanup | PASS: owned CLI stopped, listener closed |
+| Repository peer graph | PASS; isolated plugin-only profile reports host-supplied peer warnings |
+| Live browser capsule interactions | NOT VERIFIED for this host version |
+| Actual model continuation | NOT RUN; no credentials used |
+| Exact-commit hosted CI | Required before publication; verify the release commit's four matrix jobs separately |
+
+The release is authorized as an RC with the browser/model limits above. The
+four exact-commit CI jobs must pass before npm and GitHub publication. See
+[current compatibility details](docs/DSH-COMPATIBILITY.md) for fixture/real
+profile distinctions, remaining gates, and reproduction. This report records
+local evidence; the GitHub Release records remote CI and publication truth.
+
+---
+
+# Historical acceptance report — dsh-requirements-alignment v0.4.2
 
 Date: 2026-08-23 · release recheck: 2026-08-27 · package 0.4.2 · DSH 0.1.1-rc.2 · workspace: `<local-workspace>`
 

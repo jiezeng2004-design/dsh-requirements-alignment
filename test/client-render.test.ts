@@ -68,6 +68,13 @@ interface ClientExports {
   AlignmentCapsule: (props: Record<string, unknown>) => unknown;
   modeColor: (mode: string) => string;
   dictionaries: { zh: Record<string, string>; en: Record<string, string> };
+  clampPosition: (
+    pos: { left: number; top: number },
+    size: { width: number; height: number },
+    viewport: { width: number; height: number },
+  ) => { left: number; top: number };
+  readCapsulePosition: (storage: { getItem(key: string): string | null }) => { left: number; top: number } | null;
+  writeCapsulePosition: (storage: { setItem(key: string, value: string): void }, pos: { left: number; top: number }) => void;
 }
 
 interface LoaderEntry {
@@ -108,7 +115,7 @@ GS.window = {
 await import('../lib/client.js');
 
 const clientExports = (GS.window as Record<string, unknown>).__dshClientExports as ClientExports;
-const { apply, AlignmentCapsule, modeColor, dictionaries } = clientExports;
+const { apply, AlignmentCapsule, modeColor, dictionaries, clampPosition, readCapsulePosition, writeCapsulePosition } = clientExports;
 
 after(() => {
   delete GS.window;
@@ -427,4 +434,51 @@ test('client: capsule render never crashes with the full simulated payload path'
   (capsule!.props!.onClick as () => void)();
   facts = renderTree(root);
   assert.equal(facts.filter((f) => f.kind === 'element' && f.tag === 'button').length >= 7, true, 'expanded capsule renders the full control set');
+});
+
+test('client: clampPosition keeps the floating container inside the viewport', () => {
+  const viewport = { width: 1200, height: 800 };
+  const size = { width: 300, height: 60 };
+  // Already inside the viewport -> unchanged.
+  assert.deepEqual(clampPosition({ left: 100, top: 100 }, size, viewport), { left: 100, top: 100 });
+  // Past the right/bottom edges -> pulled back to the margin edge.
+  assert.deepEqual(clampPosition({ left: 1100, top: 790 }, size, viewport), { left: 892, top: 732 });
+  // Off the top/left -> pushed to the margin.
+  assert.deepEqual(clampPosition({ left: -50, top: -10 }, size, viewport), { left: 8, top: 8 });
+  // A container wider than the viewport still clamps to a sane margin (never negative).
+  assert.deepEqual(clampPosition({ left: 0, top: 0 }, { width: 1500, height: 20 }, viewport), { left: 8, top: 8 });
+});
+
+test('client: capsule position survives a storage round-trip and rejects garbage', () => {
+  const store = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => void store.set(key, value),
+  };
+  assert.equal(readCapsulePosition(storage), null, 'no stored position yet');
+  writeCapsulePosition(storage, { left: 320, top: 180 });
+  assert.deepEqual(readCapsulePosition(storage), { left: 320, top: 180 });
+  store.set('dsh-requirements-alignment.capsule-pos', '{broken');
+  assert.equal(readCapsulePosition(storage), null, 'corrupt JSON must be ignored');
+  store.set('dsh-requirements-alignment.capsule-pos', '{"left":"x","top":1}');
+  assert.equal(readCapsulePosition(storage), null, 'non-numeric coordinates must be ignored');
+});
+
+test('client: capsule button is wired for pointer dragging and a plain click still expands', () => {
+  const root = fakeReact.createElement(AlignmentCapsule, { t, useSessions });
+  let facts = renderTree(root);
+  const capsule = facts.find((f) => f.kind === 'element' && f.tag === 'button' && f.props!.className === 'dra-capsule');
+  assert.ok(capsule, 'capsule button must be present');
+  // The drag handle exposes the full pointer gesture contract.
+  for (const handler of ['onPointerDown', 'onPointerMove', 'onPointerUp', 'onPointerCancel']) {
+    assert.equal(typeof (capsule!.props as Record<string, unknown>)[handler], 'function', 'capsule must expose ' + handler);
+  }
+  // The floating container carries the ref used to move it.
+  const page = facts.find((f) => f.kind === 'element' && f.tag === 'div' && f.props!.className === 'dra-page');
+  assert.ok(page, 'floating container div must be present');
+  assert.ok((page!.props as Record<string, unknown>).ref !== undefined, 'floating container must expose its ref');
+  // A plain click (no drag) still expands the panel: both Reset buttons appear.
+  (capsule!.props!.onClick as () => void)();
+  facts = renderTree(root);
+  assert.equal(facts.filter((f) => f.kind === 'element' && f.tag === 'button' && f.props!.children === EN.reset).length, 2, 'click still expands the panel');
 });

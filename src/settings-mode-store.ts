@@ -1,7 +1,14 @@
 /**
  * The DSH Settings-backed ModeStore port.
  *
- * Persistence model (official `@deepseek-ai/dsh-settings` semantics):
+ * Current DSH 0.1.7 persistence: SettingsForms describes the owning loader
+ * entry (matched by fiber uid), and ConfigEditor persists runtimeMode in its
+ * profile configuration. Missing/null means inherit the live mode default.
+ * Revision-checked mutations preserve unrelated fields; reset writes null.
+ * The legacy adapter below exists only for historical regression fixtures,
+ * not as a claim of compatibility with older hosts.
+ *
+ * Historical fixture persistence model:
  *
  *   resolved = schema( defaults + composition base + user document section )
  *
@@ -34,13 +41,28 @@
  * @module dsh-requirements-alignment/settings-mode-store
  */
 import type { Context } from '@deepseek-ai/cordis';
-import { settingsNamespace, type SettingsProvider, type SettingsScope } from '@deepseek-ai/dsh-settings';
+import type { SettingsNamespace, SettingsForms, SettingsDescriptor } from '@deepseek-ai/dsh-settings';
 import Schema from '@deepseek-ai/schemastery';
 import { ModeStore, type ModeStorePort, type ModeStoreRead } from './mode-store.ts';
 import type { AlignmentMode } from './types.ts';
 
+// Retained only for the legacy port regression fixtures. The shipped 0.1.7
+// host uses SettingsForms and never registers a standalone namespace.
+interface SettingsScope<T> {
+    get(): T;
+    update(patch: object): Promise<void>;
+    replace(section: object): Promise<void>;
+    watch(callback: () => void): () => void;
+}
+interface LegacySettingsProvider {
+    register(ns: SettingsNamespace, schema: typeof MODE_SETTINGS_SCHEMA, options: { base: { mode: AlignmentMode } }): SettingsScope<unknown>;
+    describe(): Array<{ ns: string; user?: unknown }>;
+}
+type SettingsProvider = SettingsForms | LegacySettingsProvider;
+
 /** Lowercase kebab-case namespace owned by this plugin (pattern-checked at brand time). */
-export const SETTINGS_NAMESPACE = settingsNamespace('requirements-alignment');
+// Legacy fixture namespace. Modern profiles use the owning loader entry id.
+export const SETTINGS_NAMESPACE = 'requirements-alignment' as SettingsNamespace;
 
 /**
  * Permissive storage schema. The settings layer must never reject a stored
@@ -75,6 +97,9 @@ export class SettingsModeStorePort implements ModeStorePort {
 
     /** Whether the settings service is attached and writes can persist. */
     get persistable(): boolean {
+        if (this.provider !== undefined && !('register' in this.provider)) {
+            return this.provider.writable && this.descriptor() !== undefined;
+        }
         return this.scope !== undefined;
     }
 
@@ -93,6 +118,15 @@ export class SettingsModeStorePort implements ModeStorePort {
     }
 
     read(): ModeStoreRead {
+        if (this.provider !== undefined && !('register' in this.provider)) {
+            const descriptor = this.descriptor();
+            if (descriptor === undefined) return { resolvedMode: this.defaultMode, userHasMode: false };
+            return {
+                resolvedMode: isRecord(descriptor.value) ? descriptor.value.runtimeMode : undefined,
+                userHasMode: isRecord(descriptor.value) && descriptor.value.runtimeMode != null,
+                defaultMode: isRecord(descriptor.value) ? descriptor.value.mode : this.defaultMode
+            };
+        }
         const scope = this.scope;
         if (scope === undefined) {
             return { resolvedMode: this.defaultMode, userHasMode: false };
@@ -105,11 +139,23 @@ export class SettingsModeStorePort implements ModeStorePort {
     }
 
     async writeOverride(mode: AlignmentMode): Promise<void> {
+        if (this.provider !== undefined && !('register' in this.provider)) {
+            const descriptor = this.requireDescriptor();
+            await this.provider.mutate(descriptor.ns, [{ op: 'set', path: ['runtimeMode'], value: mode }], descriptor.revision);
+            return;
+        }
         const scope = this.requireScope();
         await scope.update({ mode });
     }
 
     async clearOverride(): Promise<void> {
+        if (this.provider !== undefined && !('register' in this.provider)) {
+            const descriptor = this.requireDescriptor();
+            // A neutral value is durable even when other config fields are
+            // overridden; native ConfigEditor writes complete config objects.
+            await this.provider.mutate(descriptor.ns, [{ op: 'set', path: ['runtimeMode'], value: null }], descriptor.revision);
+            return;
+        }
         if (this.scope === undefined) return;
         await this.scope.replace({});
     }
@@ -131,6 +177,12 @@ export class SettingsModeStorePort implements ModeStorePort {
     private attachProvider(provider: SettingsProvider): void {
         if (this.disposed) return;
         if (this.provider === provider) return; // already attached to this instance (sync + inject both fired)
+        if (!('register' in provider)) {
+            this.provider = provider;
+            this.ctx.on('settings/document-updated', () => this.onChange());
+            this.onChange();
+            return;
+        }
         if (this.scope !== undefined) {
             // A previous provider instance was replaced (reload); drop the stale
             // handle so the re-registration below is clean.
@@ -175,6 +227,24 @@ export class SettingsModeStorePort implements ModeStorePort {
             throw new Error('requirements-alignment: cannot persist a mode override: no settings service is mounted');
         }
         return scope;
+    }
+
+    private descriptor(): SettingsDescriptor | undefined {
+        if (this.provider === undefined || 'register' in this.provider) return undefined;
+        // Bind to this exact loader instance, not another plugin with a familiar id.
+        const editor = this.ctx.get('configEditor') as unknown as {
+            entries(): Array<{ fiber?: { uid: number }; options: { id: string } }>;
+        } | undefined;
+        // Cordis wraps plugin handles; uid survives those contextual proxies.
+        const owner = editor?.entries().find(entry => entry.fiber?.uid === this.ctx.fiber.uid);
+        if (owner === undefined) return undefined;
+        return this.provider.describe().find(descriptor => descriptor.ns === owner.options.id);
+    }
+
+    private requireDescriptor(): SettingsDescriptor {
+        const descriptor = this.descriptor();
+        if (descriptor === undefined) throw new Error('requirements-alignment: no live profile configuration entry is available');
+        return descriptor;
     }
 
     private userSectionHasMode(): boolean {

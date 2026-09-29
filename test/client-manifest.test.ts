@@ -1,9 +1,9 @@
 /**
- * DSH 0.1.1 client graph regression.
+ * DSH 0.1.5 client graph regression.
  *
  * Package-level `dsh.client.inject` names client graph modules: each dependency
- * must publish its own `dsh.client` row and client bundle. The rc.1 and rc.2
- * manifests for runtime and locale do; ui-slots publishes only the pure slot
+ * must publish its own `dsh.client` row and client bundle. The latest host's
+ * layout, session and locale manifests do; ui-slots publishes only the pure slot
  * registry library (no `dsh.client`, no `./client` export), so it cannot be a
  * graph edge.
  *
@@ -14,6 +14,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -41,10 +42,11 @@ function browserInjectNames(code: string): string[] {
         .filter(Boolean);
 }
 
-test('client manifest: package graph contains only real rc.2 client modules', () => {
+test('client manifest: package graph contains only real latest-host client modules', () => {
     assert.equal(manifest.dsh.client.platform, 'web');
     assert.deepEqual(manifest.dsh.client.inject, [
-        '@deepseek-ai/dsh-client-runtime',
+        '@deepseek-ai/dsh-client-ui-layout',
+        '@deepseek-ai/dsh-client-ui-session',
         '@deepseek-ai/dsh-client-locale'
     ]);
     assert.equal(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-slots'), false);
@@ -68,6 +70,17 @@ test('client manifest: browser service injection keeps slots and locale in sourc
     ] as const) {
         assert.deepEqual(browserInjectNames(code), ['slots', 'locale'], label);
     }
+});
+
+test('latest client declarations expose the capsule root slot and session selector', () => {
+    function declaration(name: string): string {
+        const path = require.resolve(name + '/package.json');
+        const pkg = JSON.parse(readFileSync(path, 'utf8'));
+        assert.equal(pkg.version, '0.1.7-rc.2');
+        return readFileSync(join(dirname(path), pkg.exports['./client'].types), 'utf8');
+    }
+    assert.match(declaration('@deepseek-ai/dsh-client-ui-layout'), /'shell\.overlay':\s*\{\s*kind: 'list';\s*scope: 'root'/);
+    assert.match(declaration('@deepseek-ai/dsh-client-ui-session'), /interface GlobalStandardProps\s*\{[\s\S]*?useSessions: UseSessions/);
 });
 
 test('client manifest: built contract registers one shell.overlay occupant', async () => {

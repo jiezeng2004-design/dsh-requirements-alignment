@@ -27,4 +27,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Includes real 0.1.7 host-service/settings/persistence integration.
       - run: pnpm run check
+      - run: pnpm peers check
+      - run: npm pack --dry-run --ignore-scripts

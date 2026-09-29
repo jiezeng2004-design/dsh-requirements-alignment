@@ -110,7 +110,7 @@ test('align-driver: resolves alignment store lazily after apply', async () => {
 
         // 3. The agent starts: the driver must read the CURRENT store view
         //    (revision 1), never the fold (revision 0).
-        ctx.emit('agent/session-start', { agent } as never);
+        await ctx.serial('agent/created', { agent, source: 'startup' } as never);
         await new Promise((resolve) => setTimeout(resolve, 10));
         const records = await readRecords(recordPath);
         const start = records.find((record) => record.phase === 'start');
@@ -175,7 +175,7 @@ test('align-driver: legacy fold fallback is preserved when no store ever appears
             baseline: { revision: 1, goal: 'legacy session', explicitConstraints: [], updatedAt: 1 }
         }, 0));
         const agent = { session, steer: () => { } };
-        ctx.emit('agent/session-start', { agent } as never);
+        await ctx.serial('agent/created', { agent, source: 'startup' } as never);
         await new Promise((resolve) => setTimeout(resolve, 10));
         const records = await readRecords(recordPath);
         const start = records.find((record) => record.phase === 'start');

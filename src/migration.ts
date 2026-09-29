@@ -46,9 +46,37 @@ import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { constants, zstdCompress, zstdDecompress } from 'node:zlib';
 import { Context } from '@deepseek-ai/cordis';
-import { SessionId, SessionStore, decodeStorageRecord, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session';
-import { SessionFormatUnsupportedError, type SessionPersistence, type SessionLocation } from '@deepseek-ai/dsh-session-persistence';
-import { JsonlSessionPersistence } from '@deepseek-ai/dsh-session-persistence-jsonl';
+import { SessionId, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session';
+import * as sessionApi from '@deepseek-ai/dsh-session';
+import { SessionFormatUnsupportedError, type SessionLocation } from '@deepseek-ai/dsh-session-persistence';
+import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
+import { assertLegacyMigrationHost } from './persistence-compat.ts';
+
+/** Frozen legacy contract: never substitute a v2 header or handle for this API. */
+interface SessionHeader {
+    version: number;
+    id: SessionId;
+    createdAt: number;
+    delegationDepth: number;
+    cwd?: string;
+    parentSession?: SessionId;
+    seedLength?: number;
+    origin?: 'subagent';
+    agentPreset?: string;
+}
+interface LegacyPersistence {
+    readRaw(id: SessionId, signal?: AbortSignal): Promise<{ meta: SessionHeader; content: string } | undefined>;
+    locate(header: SessionHeader): SessionLocation | undefined;
+    inspect(id: SessionId): Promise<unknown>;
+}
+
+function decodeStorageRecord(record: Record<string, unknown>): readonly unknown[] {
+    const decode = (sessionApi as unknown as {
+        decodeStorageRecord?: (record: Record<string, unknown>) => readonly unknown[];
+    }).decodeStorageRecord;
+    if (decode === undefined) throw new Error('migration: legacy storage decoder unavailable; no artifact changed');
+    return decode(record);
+}
 import { isLegacyAlignmentEventType, LEGACY_ALIGNMENT_EVENT_TYPES } from './types.ts';
 
 const zstdCompressAsync = promisify(zstdCompress);
@@ -283,7 +311,8 @@ export function parseArtifactText(text: string): ParsedArtifact {
         if (typeof record !== 'object' || record === null) throw new Error('migration: event line is not an object');
         const expanded = decodeStorageRecord(record as Record<string, unknown>);
         for (const event of expanded) {
-            if (typeof event.type !== 'string' || typeof event.seq !== 'number') {
+            if (typeof event !== 'object' || event === null || !('type' in event)
+                || !('seq' in event) || typeof event.type !== 'string' || typeof event.seq !== 'number') {
                 throw new Error('migration: malformed event row (missing type/seq)');
             }
             events.push(event as SessionEvent);
@@ -323,7 +352,7 @@ function jsonEqual(a: unknown, b: unknown): boolean {
  */
 export interface MigrationServices {
     /** The session persistence service (`ctx.sessionPersistence`). */
-    persistence: SessionPersistence;
+    persistence: object;
     /** The live session store (`ctx.sessions`), when mounted. */
     sessions?: { get(id: SessionId): unknown };
 }
@@ -384,12 +413,14 @@ async function verifyWithRealReader(
         const ctx = new Context();
         try {
             ctx.plugin(SessionStore);
-            await ctx.plugin(JsonlSessionPersistence, {
+            const legacyConfig = {
                 root,
                 packChunks: true,
-                compression: compression === 'zstd' ? 'zstd' : 'none'
-            });
-            await ctx.sessionPersistence.inspect(SessionId(id));
+                compression: compression === 'zstd' ? 'zstd' as const : 'none' as const
+            };
+            await ctx.plugin(JsonlSessionPersistence, legacyConfig);
+            assertLegacyMigrationHost(ctx.sessionPersistence);
+            await (ctx.sessionPersistence as unknown as LegacyPersistence).inspect(SessionId(id));
             return { loadable: true };
         } catch (error) {
             if (error instanceof SessionFormatUnsupportedError) {
@@ -442,7 +473,11 @@ export async function migrateLegacyArtifact(
     services: MigrationServices,
     options: { signal?: AbortSignal } = {}
 ): Promise<MigrationReport> {
-    const { persistence, sessions } = services;
+    const { sessions } = services;
+    // Handle-based hosts own immutable generations. Never attempt the legacy
+    // in-place repair, even if an adapter happens to retain old method names.
+    assertLegacyMigrationHost(services.persistence);
+    const persistence = services.persistence as LegacyPersistence;
     const raw = await persistence.readRaw(id, options.signal);
     if (raw === undefined) {
         throw new Error(`migration: no stored session artifact found for ${String(id)}`);

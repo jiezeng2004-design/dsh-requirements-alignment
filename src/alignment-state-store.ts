@@ -47,6 +47,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { SessionId, SessionHeader } from '@deepseek-ai/dsh-session';
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
+import { sessionEvents, type SessionEventSource } from './session-events.ts';
 import {
     defineDomain,
     domainTable,
@@ -112,11 +113,12 @@ export interface AlignmentSessionRecord {
 }
 
 /** The session surface the store needs (a real `Session` or a test double). */
-export interface AlignmentSessionLike {
+export interface AlignmentSessionLike extends SessionEventSource {
     readonly id: SessionId;
     readonly header?: SessionHeader;
-    readonly events: readonly SessionEvent[];
     readonly seq: number;
+    /** DSH 0.1.3+ stores the exact inherited prefix on Session, not its header. */
+    readonly inheritedEventCount?: number;
 }
 
 /** Minimal diagnostic sink (Cordis Logger is compatible). */
@@ -276,7 +278,7 @@ function sessionKey(session: AlignmentSessionLike): string {
 
 /** The session's current log length, from the official `seq` when present. */
 function sessionSeq(session: AlignmentSessionLike): number {
-    return typeof session.seq === 'number' ? session.seq : session.events.length;
+    return typeof session.seq === 'number' ? session.seq : sessionEvents(session).length;
 }
 
 /** Build the identity binding from a session header (absent fields default). */
@@ -623,32 +625,35 @@ export class AlignmentStateStore {
      */
     private derivedBaseRecord(session: AlignmentSessionLike): AlignmentSessionRecord | undefined {
         const header = session.header;
+        const events = sessionEvents(session);
         if (header?.parentSession !== undefined) {
-            const boundary = header.seedLength !== undefined
-                ? header.seedLength - 1
-                : Math.max(0, session.events.length - 1);
-            const inherited = this.resolveParentState(String(header.parentSession), boundary, session.events);
-            const version = legacyVersionOf(session.events);
+            const seedLength = session.inheritedEventCount
+                ?? (header as SessionHeader & { seedLength?: number }).seedLength;
+            const boundary = seedLength !== undefined
+                ? seedLength - 1
+                : Math.max(0, events.length - 1);
+            const inherited = this.resolveParentState(String(header.parentSession), boundary, events);
+            const version = legacyVersionOf(events);
             return {
                 schemaVersion: 1,
                 identity: identityFromHeader(header),
                 checkpoints: [{ visibleThroughSeq: 0, state: inherited }],
-                ...(header.seedLength === undefined ? {} : {
+                ...(seedLength === undefined ? {} : {
                     inheritedFrom: {
                         parentSession: String(header.parentSession),
                         boundarySeq: boundary,
-                        seedLength: header.seedLength
+                        seedLength
                     }
                 }),
                 ...(version === undefined ? {} : { migratedFrom: version, migratedAt: Date.now() })
             };
         }
-        if (hasLegacyAlignmentEvent(session.events)) {
-            const version = legacyVersionOf(session.events);
+        if (hasLegacyAlignmentEvent(events)) {
+            const version = legacyVersionOf(events);
             return {
                 schemaVersion: 1,
                 identity: identityFromHeader(header),
-                checkpoints: foldLegacyTimeline(session.events),
+                checkpoints: foldLegacyTimeline(events),
                 ...(version === undefined ? {} : { migratedFrom: version, migratedAt: Date.now() })
             };
         }

@@ -24,6 +24,17 @@
  */
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
 
+// DSH 0.1.7 requires each context producer to declare its own source kind.
+declare module '@deepseek-ai/dsh-llm' {
+    interface MessageSourceMap {
+        'requirements-alignment': {
+            kind: 'requirements-alignment';
+            form: 'notice';
+            summary: string;
+        };
+    }
+}
+
 /**
  * Runtime alignment operation mode: `auto` contributes the policy section,
  * tools, and `/align`; `manual` keeps tools and `/align` only; `off`

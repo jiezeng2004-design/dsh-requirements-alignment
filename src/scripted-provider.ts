@@ -11,7 +11,7 @@
  */
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { AskUserQuestionAnswerItem } from '@deepseek-ai/dsh-user-questions';
+import type { AskUserQuestionAnswerItem, AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions';
 
 /** One scripted answer. */
 export interface ScriptedAnswer {
@@ -78,8 +78,8 @@ function record(recordPath: string | undefined, line: unknown): void {
  */
 export function apply(ctx: import('@deepseek-ai/cordis').Context, config: ScriptedProviderConfig = {}): void {
     const resolved = resolveScriptedConfig(config);
-    ctx.userQuestions.registerProvider({
-        ask: async (request) => {
+    const provider = {
+        ask: async (request: AskUserQuestionRequest) => {
             const answers: AskUserQuestionAnswerItem[] = request.questions.map((question) => {
                 const hit = resolved.answers.find((answer) => answer.match === undefined || question.question.includes(answer.match))
                     ?? resolved.default;
@@ -103,7 +103,19 @@ export function apply(ctx: import('@deepseek-ai/cordis').Context, config: Script
             });
             return { answers };
         }
-    });
+    };
+    const service = ctx.userQuestions as unknown as {
+        registerProvider?: (answerer: { ask: typeof provider.ask }) => unknown;
+    };
+    if (typeof service.registerProvider === 'function') {
+        service.registerProvider(provider);
+    } else {
+        // DSH 0.1.3 routes answers through a scoped waterfall. The listener
+        // belongs to this plugin's fiber, just like the legacy registration.
+        const on = ctx.on.bind(ctx) as unknown as
+            (event: string, callback: typeof provider.ask) => () => void;
+        on('user-questions/request', provider.ask);
+    }
 }
 
 export const name = 'scripted-answers';

@@ -28,7 +28,7 @@
  *   valid persisted override  ->  valid profile default  ->  auto
  *
  * The profile (`config.mode`) is the composition default layer; a user
- * override is persisted through the DSH Settings service (`settings.yaml`);
+ * override is persisted through SettingsForms in profile `runtimeMode`;
  * the effective mode is whichever layer resolves. ModeStore owns that
  * resolution.
  *
@@ -57,6 +57,7 @@
  */
 import { Service } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
+import { isVolatile, type Volatile } from '@deepseek-ai/cosmokit';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
@@ -65,7 +66,7 @@ import type { CommandResult } from '@deepseek-ai/dsh-commands';
 import { MANUAL_CHECK_MESSAGE } from './policy.ts';
 import { AlignmentStateStore, type AlignmentSessionLike } from './alignment-state-store.ts';
 import { SessionModeStore } from './session-mode-store.ts';
-import { migrateLegacyArtifact } from './migration.ts';
+import { assertLegacyMigrationHost } from './persistence-compat.ts';
 import {
     ALIGNMENT_MODES,
     validateAlignmentMode as validateMode,
@@ -87,7 +88,9 @@ export { ALIGNMENT_MODES };
 /** Raw plugin config. */
 export interface Config {
     /** Profile default: `auto` (default) contributes the policy section; `manual` only the /align command and tools; `off` nothing. A persisted override wins over this at runtime. */
-    mode?: AlignmentMode;
+    mode?: AlignmentMode | Volatile<AlignmentMode>;
+    /** Persisted shared override; null follows the profile mode. */
+    runtimeMode?: AlignmentMode | null | Volatile<AlignmentMode | null>;
     /** Optional deployment-owned policy text replacing the shipped one (auto mode). */
     section?: string;
 }
@@ -100,8 +103,11 @@ export interface Config {
  * before the plugin starts.
  */
 export const ConfigSchema = Schema.object({
+    runtimeMode: Schema.union([Schema.union(ALIGNMENT_MODES), Schema.const(null)]).default(null).volatile()
+        .description('Shared alignment override. Null follows the profile mode; session overrides still win.'),
     mode: Schema.union(ALIGNMENT_MODES)
         .default('auto')
+        .volatile()
         .description('Profile default alignment mode. Auto contributes the policy section, tools, and /align. Manual keeps tools and /align only. Off unregisters those and keeps /align-mode so the mode can be switched live. A persisted user override wins at runtime.'),
     section: Schema.string()
         .pattern(/\S/)
@@ -111,6 +117,7 @@ export const ConfigSchema = Schema.object({
 /** A validated, detached config. */
 export interface ResolvedConfig {
     mode: AlignmentMode;
+    runtimeMode?: AlignmentMode | null;
     section?: string;
 }
 
@@ -122,15 +129,18 @@ export interface ResolvedConfig {
  * @returns A detached validated config.
  */
 export function resolveConfig(config: Config = {}): ResolvedConfig {
-    const unknown = Object.keys(config).filter((key) => key !== 'mode' && key !== 'section');
-    if (unknown.length > 0) throw new Error(`RequirementsAlignmentConfig has unknown key(s) ${unknown.join(', ')} - config is { mode?, section? }`);
-    const mode = config.mode ?? 'auto';
+    const unknown = Object.keys(config).filter((key) => key !== 'mode' && key !== 'section' && key !== 'runtimeMode');
+    if (unknown.length > 0) throw new Error(`RequirementsAlignmentConfig has unknown key(s) ${unknown.join(', ')} - config is { mode?, runtimeMode?, section? }`);
+    const mode = (isVolatile(config.mode) ? config.mode.get() : config.mode) ?? 'auto';
     if (mode !== 'auto' && mode !== 'manual' && mode !== 'off') throw new Error(`RequirementsAlignmentConfig mode must be 'auto', 'manual', or 'off', got ${JSON.stringify(mode)}`);
+    const runtimeMode = isVolatile(config.runtimeMode) ? config.runtimeMode.get() : config.runtimeMode;
+    if (runtimeMode !== undefined && runtimeMode !== null && !ALIGNMENT_MODES.includes(runtimeMode)) throw new Error('Invalid runtimeMode');
     if (config.section !== undefined) {
         if (typeof config.section !== 'string') throw new Error('RequirementsAlignmentConfig section must be a string');
         if (config.section.trim() === '') throw new Error('RequirementsAlignmentConfig section must be non-empty when provided');
     }
-    return config.section === undefined ? { mode } : { mode, section: config.section };
+    return { mode, ...(config.section === undefined ? {} : { section: config.section }),
+        ...(runtimeMode === undefined ? {} : { runtimeMode }) };
 }
 
 /** Human-readable status label for one folded posture. */
@@ -339,7 +349,7 @@ function errorMessage(error: unknown): string {
  * (including off), so switching modes never loses state.
  *
  * Capability model (v0.4.0): alignment capabilities live in each agent's own
- * scope. `agent/session-start` calls {@link initializeAgent}, which resolves
+ * scope. The serial `agent/created` listener adopts sidecars, then resolves
  * the session's effective mode (session override -> shared override -> profile
  * default -> auto) and registers the matching capabilities on `agent.ctx`.
  * `/align-mode session` changes only the calling session's override (and
@@ -426,7 +436,7 @@ export class RequirementsAlignmentController extends Service {
         });
         // `/align-mode` is ALWAYS registered at plugin scope (the control
         // group): an Off session keeps it so a live switch to Off is reversible
-        // without editing settings.yaml.
+        // without manual configuration edits.
         this.registerModeCommand();
         // Shared-layer changes resync every agent that has no session override;
         // while a mode mutation owns the reconcile (exclusive), the change is
@@ -544,22 +554,14 @@ export class RequirementsAlignmentController extends Service {
             const api = createManagementApi(this);
             return api.register(webCtx.webServer);
         });
-        // Register the agent's capabilities at `agent/created` (BEFORE
-        // `agent/session-start`): the agent is fully configured and its scoped
-        // context is live, and `agent/session-start` observers (the dogfood
-        // driver) can then read the already-registered capabilities regardless
-        // of listener dispatch order.
-        this.ctx.on('agent/created', (payload: { agent: Agent }) => {
+        // Adopt durable state and register capabilities during the awaited
+        // serial creation event, before the host releases queued input.
+        this.ctx.on('agent/created', async (payload: { agent: Agent }) => {
+            // DSH 0.1.7 awaits this serial event before releasing queued input.
+            // Adopt inherited state before registering any live capabilities.
+            await this.initializeSessionState(payload.agent);
             this.syncAgent(payload.agent);
-        });
-        // `agent/session-start` adopts the durable sidecars: pin fork
-        // inheritance (alignment state AND session-mode override). A
-        // fork-inherited session override notifies the SessionModeStore
-        // subscription, which re-syncs the child to the inherited mode.
-        this.ctx.on('agent/session-start', (payload: { agent: Agent }) => {
-            void this.initializeSessionState(payload.agent).catch((error: unknown) => {
-                this.ctx.logger?.warn('requirements-alignment: failed to initialize alignment state for a session: %o', error);
-            });
+            return undefined;
         });
         this.ctx.on('agent/disposed', (payload: { agent: Agent }) => {
             // agent.ctx unwinds its registrations on disposal; just drop the
@@ -571,9 +573,9 @@ export class RequirementsAlignmentController extends Service {
 
     /**
      * Adopt one session's durable sidecars: pin fork inheritance (alignment
-     * state + session-mode override). The agent's capabilities were already
-     * registered at `agent/created`; a fork-inherited override re-syncs them
-     * through the SessionModeStore subscription. Idempotent — repeated
+     * state + session-mode override), before initial capability registration
+     * in `agent/created`. Subsequent changes re-sync capabilities through the
+     * SessionModeStore subscription. Idempotent — repeated
      * adoption never duplicates state or capabilities.
      */
     private async initializeSessionState(agent: Agent): Promise<void> {
@@ -963,8 +965,7 @@ export class RequirementsAlignmentController extends Service {
         agent.steer(createUserMessage({
             content: [{ type: 'text', text: `${MANUAL_CHECK_MESSAGE}\n\n${report}` }],
             source: {
-                kind: 'plugin',
-                plugin: 'requirements-alignment',
+                kind: 'requirements-alignment',
                 form: 'notice',
                 summary: 'Requirements Alignment check started'
             }
@@ -1319,6 +1320,8 @@ export class RequirementsAlignmentController extends Service {
         const target = rawInput.trim();
         const id = target === '' ? String(agent.session.id) : target;
         try {
+            assertLegacyMigrationHost(persistence);
+            const { migrateLegacyArtifact } = await import('./migration.ts');
             const report = await migrateLegacyArtifact(SessionId(id), {
                 persistence,
                 sessions: this.ctx.get('sessions')
